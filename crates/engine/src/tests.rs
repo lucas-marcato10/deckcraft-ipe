@@ -7029,3 +7029,27 @@ fn outline_export_skips_footer_date_and_slide_number() {
     assert!(rtf.contains("Agenda") && rtf.contains("First point"), "{rtf:?}");
     assert!(!rtf.contains("Company Confidential") && !rtf.contains("1 May 2026"), "{rtf:?}");
 }
+
+/// Bug B: móvel equidistante do vizinho e do centro do slide gruda no vizinho, não no slide.
+/// (Números corrigidos vs. o plano: o arrasto de 2 pt do rascunho ficava abaixo do dead-zone
+/// de 3 pt do `drag_move`, então a forma nem se movia e o teste falhava pelo motivo errado.)
+#[test]
+fn move_prefers_neighbor_over_slide_center_on_tie() {
+    let mut s = session();
+    // Blank: os placeholders do layout padrão têm centro em W/2 e empatariam como shape (prio 0).
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    let cx = s.doc().unwrap().doc.slide_size.width / 2.0;
+    // Vizinho com right edge em cx - 8.
+    let other = [cx - 108.0, 300.0, 100.0, 80.0];
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": other})).unwrap();
+    // Móvel (w=100) em cx + 16; arrasto de 20 pt deixa a borda esquerda crua em cx - 4:
+    // 4 pt do vizinho (cx - 8) E 4 pt do centro do slide (cx) — empate exato dentro da
+    // tolerância do move (tol do gesto 3.0 * 1.5 = 4.5). Adjacência tem que vencer o ímã.
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [cx + 16.0, 300.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    drag_gesture(&mut s, (cx + 66.0, 340.0), (cx + 46.0, 340.0));
+    let b = box_of(&mut s, id);
+    assert_eq!(b["x"], cx - 8.0, "era para encostar no vizinho (cx - 8), não no centro do slide (cx = {cx}): {b}");
+}
