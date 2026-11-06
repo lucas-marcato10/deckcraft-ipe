@@ -7130,3 +7130,31 @@ fn spacing_splits_the_difference_between_two_neighbours() {
     assert!(s.tool.spacing.iter().any(|sp| sp.vertical && (sp.gap - 100.0).abs() < 1e-6), "esperava um spacing de 100 pt: {:?}", s.tool.spacing);
     s.pointer(ev(PointerKind::Up, (253.0, 140.0))).unwrap();
 }
+
+/// #3701 (regressão): o move gruda os bounds movidos, não o ponto do clique. Três press spots
+/// no mesmo shape, mesmo delta (+97) → as três rodadas terminam na MESMA posição grudada.
+/// No fork do Vectorcraft (970e62f) o snap usava o ponto pressionado (`snap(cx, start, d)`) e o
+/// resultado dependia de ONDE se clicava; aqui só importa a geometria: borda direita crua 297 a
+/// 3 pt do vizinho 300 → x = 200 em todos os press spots.
+#[test]
+fn move_snaps_the_bounds_not_the_pressed_spot() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    // Vizinho parado, borda esquerda em 300. O móvel cruza +97: [100..200] → [197..297];
+    // a borda direita a 3 pt de 300 gruda (tol do drag_move = 3.0 * 1.5 = 4.5) → x = 200.
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 100.0, 100.0, 80.0]})).unwrap();
+    for press_x in [110.0, 150.0, 190.0] {
+        let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+        // Press a ≥10 pt das alças de resize (tol de alça = 3.0 * 1.6 = 4.8): 103/197 pegariam W/E.
+        let down = drag_gesture(&mut s, (press_x, 140.0), (press_x + 97.0, 140.0));
+        assert_eq!(down["hit"]["kind"], "shape", "press em {press_x} tinha que começar um MOVE, não pegar alça: {down}");
+        let b = box_of(&mut s, id);
+        assert_eq!(b["x"], 200.0, "press em {press_x}: borda direita crua 297 → gruda no vizinho 300 → x=200: {b}");
+        assert_eq!(b["y"], 100.0, "press em {press_x}: sem deriva em Y: {b}");
+        // Cena isolada para a próxima rodada: desfaz o move (1 undo) e apaga o móvel.
+        s.execute("edit.undo", &json!({})).unwrap();
+        s.execute("edit.delete", &json!({"ids": [id]})).unwrap();
+    }
+}
