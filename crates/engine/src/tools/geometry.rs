@@ -3,6 +3,37 @@ use super::{
     Drag, Guide, HistoryEntry, Point, Rect, Result, Session, Shape, ShapeId, ShapeKind, Spacing, ToolKind, Value, Vec2, Xfrm, cmd, json, xfrm_of,
 };
 
+/// Above this many 1-D candidates (~1300 shapes × 3) an edge scan consults a ±4·tol window of
+/// the sorted vector instead of walking the whole list; below it the flat scan is cheaper.
+const SNAP_DIRECT_MAX: usize = 4000;
+
+/// The candidates within `win` of `edge`, in a vector sorted by position (ascending, all finite).
+/// The band is inclusive at both bounds and empty when `edge` is not finite — never a panic.
+fn snap_window(cands: &[(f64, u8)], edge: f64, win: f64) -> &[(f64, u8)] {
+    let win = win.max(0.0);
+    let lo = cands.partition_point(|c| c.0 < edge - win);
+    let hi = cands.partition_point(|c| c.0 <= edge + win);
+    &cands[lo..hi]
+}
+
+/// Every candidate within `tol` of an enabled box edge (`edges` is start/centre/end, `on` says
+/// which take part), as `(d, pos, prio, edge index)`. `window` may narrow the scan to a ±4·tol
+/// band of `cands`; the band is only a superset, so the result is identical either way.
+fn axis_hits(edges: [f64; 3], on: [bool; 3], cands: &[(f64, u8)], tol: f64, window: bool) -> Vec<(f64, f64, u8, usize)> {
+    let win = tol * 4.0; // 4× headroom over the effective threshold (callers already pass tol*1.5)
+    let mut hits: Vec<(f64, f64, u8, usize)> = Vec::new();
+    for (ei, edge) in edges.into_iter().zip(on).enumerate().filter_map(|(ei, (e, on))| on.then_some((ei, e))) {
+        let band: &[(f64, u8)] = if window { snap_window(cands, edge, win) } else { cands };
+        for (pos, pri) in band {
+            let d = *pos - edge;
+            if d.abs() <= tol {
+                hits.push((d, *pos, *pri, ei));
+            }
+        }
+    }
+    hits
+}
+
 /// Priority of a snap candidate: neighbouring shape (0) > manual guide (1) > slide (2).
 /// Lowest wins, so on a `|d|` tie adjacency beats the slide's magnets (Bug B).
 fn cand_prio(is_slide: bool, is_manual: bool) -> u8 {
@@ -324,11 +355,24 @@ impl Session {
                 }
             }
         }
+        // The shape loop is the only source of volume (and of junk): one reserve per vector so a
+        // mouse-move never reallocates.
+        let extra = 3 * st.shapes().len() + st.doc.guides.len() + 8;
+        xs2.reserve(extra);
+        ys2.reserve(extra);
         for sh in st.shapes() {
             if exclude.contains(&sh.id) || sh.hidden {
                 continue;
             }
             let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
+            // A non-finite or degenerate bbox has no usable edge and would break the total order
+            // the sort and the binary window rely on.
+            if !b.x0.is_finite() || !b.x1.is_finite() || !b.y0.is_finite() || !b.y1.is_finite() {
+                continue;
+            }
+            if b.width() <= 1e-9 || b.height() <= 1e-9 {
+                continue;
+            }
             for x in [b.x0, b.center().x, b.x1] {
                 xs2.push((x, cand_prio(false, false)));
             }
@@ -336,15 +380,11 @@ impl Session {
                 ys2.push((y, cand_prio(false, false)));
             }
         }
-        let mut hits_x: Vec<(f64, f64, u8, usize)> = vec![]; // (d, pos, prio, edge)
-        for (ei, edge) in [r.x0, r.center().x, r.x1].into_iter().zip(xs_on).enumerate().filter_map(|(ei, (e, on))| on.then_some((ei, e))) {
-            for (x, pri) in &xs2 {
-                let d = *x - edge;
-                if d.abs() <= tol {
-                    hits_x.push((d, *x, *pri, ei));
-                }
-            }
-        }
+        // One order for both paths: the flat loop tolerates any order, the binary window needs
+        // ascending positions — and ties now resolve to the lowest position, deterministically.
+        xs2.sort_by(|a, b| a.0.total_cmp(&b.0));
+        ys2.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut hits_x = axis_hits([r.x0, r.center().x, r.x1], xs_on, &xs2, tol, xs2.len() >= SNAP_DIRECT_MAX);
         hits_x.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.abs().total_cmp(&b.0.abs())));
         let mut wins_x = pick_wins(&hits_x);
         // A live hold wins its axis outright: it beats a nearer line (temporal hysteresis).
@@ -357,15 +397,7 @@ impl Session {
             }
         }
         self.tool.snap_hold.0 = wins_x.first().map(|&(_, pos, _, ei)| (pos, ei));
-        let mut hits_y: Vec<(f64, f64, u8, usize)> = vec![]; // (d, pos, prio, edge)
-        for (ei, edge) in [r.y0, r.center().y, r.y1].into_iter().zip(ys_on).enumerate().filter_map(|(ei, (e, on))| on.then_some((ei, e))) {
-            for (y, pri) in &ys2 {
-                let d = *y - edge;
-                if d.abs() <= tol {
-                    hits_y.push((d, *y, *pri, ei));
-                }
-            }
-        }
+        let mut hits_y = axis_hits([r.y0, r.center().y, r.y1], ys_on, &ys2, tol, ys2.len() >= SNAP_DIRECT_MAX);
         hits_y.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.abs().total_cmp(&b.0.abs())));
         let mut wins_y = pick_wins(&hits_y);
         if let Some((hpos, hedge)) = self.tool.snap_hold.1 {
@@ -524,5 +556,24 @@ impl Session {
             crate::push_undo(st, HistoryEntry { label: "Erase".into(), doc: before, selection: sel_before, vertex_kind });
         }
         Ok(Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window is exactly [edge-win, edge+win]: inclusive at both bounds, empty far away,
+    /// and never a panic (empty list, window past either end).
+    #[test]
+    fn snap_window_covers_the_band_and_not_the_edges() {
+        let c = |p: f64| (p, 0u8);
+        let mut cands = [c(-100.0), c(0.0), c(5.0), c(6.5), c(7.0), c(100.0)];
+        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let xs: Vec<f64> = snap_window(&cands, 5.0, 4.0).iter().map(|c| c.0).collect();
+        assert_eq!(xs, vec![5.0, 6.5, 7.0], "band [1,9]: 0 and 100 stay out");
+        assert_eq!(snap_window(&cands, 5.0, 0.0).len(), 1, "win=0 still catches the exact edge");
+        assert!(snap_window(&cands, 200.0, 4.0).is_empty(), "past the end: empty, no panic");
+        assert!(snap_window(&[], 0.0, 4.0).is_empty(), "empty candidates: empty window");
     }
 }
