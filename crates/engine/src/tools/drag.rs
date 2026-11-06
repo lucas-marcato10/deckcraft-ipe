@@ -224,9 +224,10 @@ impl Session {
         // Smart guides on the moved group's bounds.
         let bounds = origs.iter().map(|(_, x)| x.bounds()).reduce(|a, b| a.union(b)).unwrap_or_default();
         let moved_b = bounds + d;
-        let (snap, guides) = self.snap_rect(moved_b, &ids_now, tol * 1.5, !mods.cmd);
+        let (snap, guides, spacing) = self.snap_rect(moved_b, &ids_now, tol * 1.5, !mods.cmd);
         d += snap;
         self.tool.guides = guides;
+        self.tool.spacing = spacing;
         let origs2: Vec<(ShapeId, Xfrm)> = if duplicate { ids_now.iter().copied().zip(origs.iter().map(|o| o.1)).collect() } else { origs.clone() };
         self.edit(|doc, sel| {
             let list = crate::shapes_mut(doc, sel).ok_or_else(|| cmd::bad("move", "no slide"))?;

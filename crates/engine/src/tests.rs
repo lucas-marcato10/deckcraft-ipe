@@ -7080,3 +7080,53 @@ fn smart_guides_show_both_edges_when_both_align() {
     }
     s.pointer(ev(PointerKind::Up, (150.0, 140.0))).unwrap();
 }
+
+/// Spacing A-B-C: A=[0..100] e B=[150..250] deixam um gap de 50; o móvel C (w=100) arrastado
+/// até [303..403] gruda em x=300 para o gap B-C medir os mesmos 50, e o spacing reporta 50 pt
+/// no eixo X — o eixo Y está alinhado (y=100/140/180), então lá não há spacing.
+#[test]
+fn spacing_snaps_to_equal_gap_and_reports_it() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [0.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [150.0, 100.0, 100.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [306.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    // Spacing só existe durante o drag (Up limpa, como as guias): Down → Drag → LÊ → Up.
+    let ev = |kind, (x, y): (f64, f64)| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, (356.0, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (354.5, 140.0))).unwrap(); // 1.5 < tol: no-op, espelha o drag_gesture
+    s.pointer(ev(PointerKind::Drag, (353.0, 140.0))).unwrap(); // cru: C em [303..403]
+    let b = box_of(&mut s, id);
+    assert_eq!(b["x"], 300.0, "o gap B-C tinha que igualar o gap A-B (50) e grudar C em 300: {b}");
+    assert!(
+        s.tool.spacing.iter().any(|sp| sp.vertical && (sp.gap - 50.0).abs() < 1e-6),
+        "esperava um spacing de 50 pt no eixo X: {:?}",
+        s.tool.spacing
+    );
+    assert!(s.tool.spacing.iter().all(|sp| sp.vertical), "com Y alinhado, spacing só no X: {:?}", s.tool.spacing);
+    s.pointer(ev(PointerKind::Up, (353.0, 140.0))).unwrap();
+    assert!(s.tool.spacing.is_empty(), "Up limpa o spacing: {:?}", s.tool.spacing);
+}
+
+/// Spacing entre dois vizinhos: o móvel entre A e C com gaps desiguais (103 e 97) anda 3 pt
+/// para os dois ficarem em 100 — e o spacing reporta esse 100.
+#[test]
+fn spacing_splits_the_difference_between_two_neighbours() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [0.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [400.0, 100.0, 100.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [206.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, (x, y): (f64, f64)| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, (256.0, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (254.5, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (253.0, 140.0))).unwrap(); // cru: C em [203..303]
+    let b = box_of(&mut s, id);
+    assert_eq!(b["x"], 200.0, "gaps 103/97 tinham que virar 100/100: {b}");
+    assert!(s.tool.spacing.iter().any(|sp| sp.vertical && (sp.gap - 100.0).abs() < 1e-6), "esperava um spacing de 100 pt: {:?}", s.tool.spacing);
+    s.pointer(ev(PointerKind::Up, (253.0, 140.0))).unwrap();
+}

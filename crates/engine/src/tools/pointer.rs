@@ -445,6 +445,7 @@ impl Session {
     fn up(&mut self, p: Point, mods: Mods) -> Result<Value> {
         let drag = self.tool.drag.take();
         self.tool.guides.clear();
+        self.tool.spacing.clear();
         self.tool.sites.clear();
         self.tool.glue = None;
         let mut out = Value::Null;

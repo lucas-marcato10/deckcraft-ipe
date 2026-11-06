@@ -1,5 +1,7 @@
 use super::hit::table_rows;
-use super::{Drag, Guide, HistoryEntry, Point, Rect, Result, Session, Shape, ShapeId, ShapeKind, ToolKind, Value, Vec2, Xfrm, cmd, json, xfrm_of};
+use super::{
+    Drag, Guide, HistoryEntry, Point, Rect, Result, Session, Shape, ShapeId, ShapeKind, Spacing, ToolKind, Value, Vec2, Xfrm, cmd, json, xfrm_of,
+};
 
 /// Priority of a snap candidate: neighbouring shape (0) > manual guide (1) > slide (2).
 /// Lowest wins, so on a `|d|` tie adjacency beats the slide's magnets (Bug B).
@@ -11,6 +13,14 @@ fn cand_prio(is_slide: bool, is_manual: bool) -> u8 {
     } else {
         0
     }
+}
+
+/// Which of a box's edges take part in the snap (left/centre/right, top/centre/bottom), and
+/// whether equal-gap spacing applies to an axis with no alignment.
+struct SnapEdges {
+    xs_on: [bool; 3],
+    ys_on: [bool; 3],
+    spacing: bool,
 }
 
 /// Até 2 linhas distintas (|Δpos| > 1e-6) que continuam EXATAS depois do offset escolhido.
@@ -166,18 +176,121 @@ impl Session {
     }
 
     /// Smart guides: snap `r` edges/centres to the slide and other shapes. Returns the offset to
-    /// apply and the guides to draw.
-    pub(super) fn snap_rect(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool) -> (Vec2, Vec<Guide>) {
-        self.snap_edges(r, exclude, tol, enabled, [true; 3], [true; 3])
+    /// apply, the guides to draw and the equal-gap measurements to label.
+    pub(super) fn snap_rect(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool) -> (Vec2, Vec<Guide>, Vec<Spacing>) {
+        self.snap_edges(r, exclude, tol, enabled, SnapEdges { xs_on: [true; 3], ys_on: [true; 3], spacing: true })
+    }
+
+    /// Equal-gap spacing on X: the moved box `r` keeps the gap between its immediate left
+    /// neighbour and that neighbour's own left neighbour (an A-B-C chain), or, sitting between
+    /// two neighbours, splits the difference so both gaps match. `None` unless a candidate lands
+    /// within `tol`. `at` is the row's centre, where the measuring line is drawn.
+    fn spacing_shift_x(&self, r: Rect, exclude: &[ShapeId], tol: f64) -> Option<(f64, Spacing)> {
+        let st = self.active()?;
+        let mut segs: Vec<(f64, f64)> = vec![]; // (x0, x1) of the boxes sharing the row
+        for sh in st.shapes() {
+            if exclude.contains(&sh.id) || sh.hidden {
+                continue;
+            }
+            let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
+            if b.width() < 1e-9 || b.height() < 1e-9 {
+                continue;
+            }
+            // Only boxes that share the row: a gap measured against a box on another row would
+            // draw its line over empty slide.
+            if b.y1 < r.y0 - 1e-6 || b.y0 > r.y1 + 1e-6 {
+                continue;
+            }
+            segs.push((b.x0, b.x1));
+        }
+        let left = segs.iter().filter(|s| s.1 <= r.x0 + 1e-6).max_by(|a, b| a.1.total_cmp(&b.1)).copied();
+        let right = segs.iter().filter(|s| s.0 >= r.x1 - 1e-6).min_by(|a, b| a.0.total_cmp(&b.0)).copied();
+        let mut cands: Vec<(f64, f64)> = vec![]; // (dx, gap)
+        // A-B-C: continue the chain after a pair, keeping the pair's own gap.
+        if let Some(l) = left
+            && let Some(ll) = segs.iter().filter(|s| s.1 <= l.0 - 1e-6).max_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            let gap = l.0 - ll.1;
+            if gap > 1e-9 {
+                cands.push((l.1 + gap - r.x0, gap));
+            }
+        }
+        // C-B-A: the same chain, mirrored (the box sits left of a pair).
+        if let Some(rr) = right
+            && let Some(rrr) = segs.iter().filter(|s| s.0 >= rr.1 + 1e-6).min_by(|a, b| a.0.total_cmp(&b.0))
+        {
+            let gap = rrr.0 - rr.1;
+            if gap > 1e-9 {
+                cands.push((rr.0 - gap - r.width() - r.x0, gap));
+            }
+        }
+        // Between two neighbours: equalize both gaps by moving half the difference.
+        if let (Some(l), Some(rr)) = (left, right) {
+            let (gap_l, gap_r) = (r.x0 - l.1, rr.0 - r.x1);
+            if gap_l >= -1e-9 && gap_r >= -1e-9 && (gap_l + gap_r) / 2.0 > 1e-9 {
+                cands.push(((gap_r - gap_l) / 2.0, (gap_l + gap_r) / 2.0));
+            }
+        }
+        let (dx, gap) = cands.into_iter().filter(|(dx, _)| dx.abs() <= tol).min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))?;
+        Some((dx, Spacing { vertical: true, a: r.x0 + dx - gap, b: r.x0 + dx, at: r.center().y, gap }))
+    }
+
+    /// `spacing_shift_x` on the other axis: `a`/`b`/`at` are y positions and the measuring line
+    /// runs across the column.
+    fn spacing_shift_y(&self, r: Rect, exclude: &[ShapeId], tol: f64) -> Option<(f64, Spacing)> {
+        let st = self.active()?;
+        let mut segs: Vec<(f64, f64)> = vec![]; // (y0, y1) of the boxes sharing the column
+        for sh in st.shapes() {
+            if exclude.contains(&sh.id) || sh.hidden {
+                continue;
+            }
+            let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
+            if b.width() < 1e-9 || b.height() < 1e-9 {
+                continue;
+            }
+            if b.x1 < r.x0 - 1e-6 || b.x0 > r.x1 + 1e-6 {
+                continue;
+            }
+            segs.push((b.y0, b.y1));
+        }
+        let above = segs.iter().filter(|s| s.1 <= r.y0 + 1e-6).max_by(|a, b| a.1.total_cmp(&b.1)).copied();
+        let below = segs.iter().filter(|s| s.0 >= r.y1 - 1e-6).min_by(|a, b| a.0.total_cmp(&b.0)).copied();
+        let mut cands: Vec<(f64, f64)> = vec![]; // (dy, gap)
+        if let Some(a) = above
+            && let Some(aa) = segs.iter().filter(|s| s.1 <= a.0 - 1e-6).max_by(|x, y| x.1.total_cmp(&y.1))
+        {
+            let gap = a.0 - aa.1;
+            if gap > 1e-9 {
+                cands.push((a.1 + gap - r.y0, gap));
+            }
+        }
+        if let Some(b) = below
+            && let Some(bb) = segs.iter().filter(|s| s.0 >= b.1 + 1e-6).min_by(|x, y| x.0.total_cmp(&y.0))
+        {
+            let gap = bb.0 - b.1;
+            if gap > 1e-9 {
+                cands.push((b.0 - gap - r.height() - r.y0, gap));
+            }
+        }
+        if let (Some(a), Some(b)) = (above, below) {
+            let (gap_a, gap_b) = (r.y0 - a.1, b.0 - r.y1);
+            if gap_a >= -1e-9 && gap_b >= -1e-9 && (gap_a + gap_b) / 2.0 > 1e-9 {
+                cands.push(((gap_b - gap_a) / 2.0, (gap_a + gap_b) / 2.0));
+            }
+        }
+        let (dy, gap) = cands.into_iter().filter(|(dy, _)| dy.abs() <= tol).min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))?;
+        Some((dy, Spacing { vertical: false, a: r.y0 + dy - gap, b: r.y0 + dy, at: r.center().x, gap }))
     }
 
     /// `snap_rect` looking only at some of `r`'s edges: `xs_on` is left, centre, right and `ys_on`
     /// top, centre, bottom. Resizing passes just the edges being dragged, so a fixed edge that
     /// already sits on a line (distance 0) doesn't win and leave the dragged edge unsnapped.
-    fn snap_edges(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool, xs_on: [bool; 3], ys_on: [bool; 3]) -> (Vec2, Vec<Guide>) {
-        let Some(st) = self.active() else { return (Vec2::ZERO, vec![]) };
+    /// `spacing` is off for a resize: equal gaps only make sense for a whole box that moves.
+    fn snap_edges(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool, edges: SnapEdges) -> (Vec2, Vec<Guide>, Vec<Spacing>) {
+        let SnapEdges { xs_on, ys_on, spacing } = edges;
+        let Some(st) = self.active() else { return (Vec2::ZERO, vec![], vec![]) };
         if !enabled || !self.prefs.smart_guides {
-            return (Vec2::ZERO, vec![]);
+            return (Vec2::ZERO, vec![], vec![]);
         }
         let size = st.doc.slide_size;
         let mut xs2: Vec<(f64, u8)> =
@@ -229,11 +342,17 @@ impl Session {
         let wins_y = pick_wins(&hits_y);
         let mut off = Vec2::ZERO;
         let mut guides = vec![];
+        let mut spacings: Vec<Spacing> = vec![];
         if let Some(&(d, _, _)) = wins_x.first() {
             off.x = d;
             for &(_, pos, _) in &wins_x {
                 guides.push(Guide { vertical: true, pos, from: 0.0, to: size.height });
             }
+        } else if spacing && let Some((dx, sp)) = self.spacing_shift_x(r, exclude, tol) {
+            // Equal gap, not an alignment: no full-span line, only the short measurement (the
+            // render draws it from `spacing`).
+            off.x = dx;
+            spacings.push(sp);
         } else if self.prefs.snap_to_grid && xs_on.contains(&true) {
             let at = if xs_on[0] {
                 r.x0
@@ -249,6 +368,9 @@ impl Session {
             for &(_, pos, _) in &wins_y {
                 guides.push(Guide { vertical: false, pos, from: 0.0, to: size.width });
             }
+        } else if spacing && let Some((dy, sp)) = self.spacing_shift_y(r, exclude, tol) {
+            off.y = dy;
+            spacings.push(sp);
         } else if self.prefs.snap_to_grid && ys_on.contains(&true) {
             let at = if ys_on[0] {
                 r.y0
@@ -259,13 +381,14 @@ impl Session {
             };
             off.y = deckcraft_geom::snap(at, self.prefs.grid_spacing) - at;
         }
-        (off, guides)
+        (off, guides, spacings)
     }
 
     /// Snap the edges that resize handle `handle` drags in the resized box `x` to the smart guides.
     pub(super) fn snap_resize(&mut self, x: Xfrm, handle: u8, exclude: &[ShapeId], tol: f64) -> Xfrm {
         if x.rot != 0.0 {
             self.tool.guides.clear();
+            self.tool.spacing.clear();
             return x;
         }
         let r = x.rect();
@@ -276,7 +399,13 @@ impl Session {
         let (top, bottom) = (matches!(handle, 0..=2), matches!(handle, 4..=6));
         let (moves_left, moves_right) = if x.flip_h { (right, left) } else { (left, right) };
         let (moves_top, moves_bottom) = if x.flip_v { (bottom, top) } else { (top, bottom) };
-        let (off, guides) = self.snap_edges(r, exclude, tol * 1.5, true, [moves_left, false, moves_right], [moves_top, false, moves_bottom]);
+        let (off, guides, spacings) = self.snap_edges(
+            r,
+            exclude,
+            tol * 1.5,
+            true,
+            SnapEdges { xs_on: [moves_left, false, moves_right], ys_on: [moves_top, false, moves_bottom], spacing: false },
+        );
         let mut nx = x;
         if moves_left {
             nx.x += off.x;
@@ -293,6 +422,7 @@ impl Session {
         nx.w = nx.w.max(0.0);
         nx.h = nx.h.max(0.0);
         self.tool.guides = guides;
+        self.tool.spacing = spacings;
         nx
     }
 

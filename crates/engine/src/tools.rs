@@ -255,6 +255,18 @@ pub struct Guide {
     pub to: f64,
 }
 
+/// A gap measured between two neighbours for equidistance: `vertical` measures the distance along
+/// X (`a`/`b` are x positions), otherwise along Y. `at` is the cross-axis position the measuring
+/// line is drawn at, and `gap` the distance itself, in slide points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spacing {
+    pub vertical: bool,
+    pub a: f64,
+    pub b: f64,
+    pub at: f64,
+    pub gap: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ToolState {
     pub kind: ToolKind,
@@ -264,6 +276,9 @@ pub struct ToolState {
     pub marquee: Option<Rect>,
     pub preview: Option<Xfrm>,
     pub guides: Vec<Guide>,
+    /// Equal-gap spacing of the move in progress, at most one per axis. Transient UI state (like
+    /// `guides`), so `Guide`'s serialized shape stays untouched.
+    pub spacing: Vec<Spacing>,
     pub hover: Option<Hit>,
     pub ink_preview: Vec<(f64, f64, f32)>,
     /// Connection sites to show (slide coordinates) while drawing or dragging a line end, and the

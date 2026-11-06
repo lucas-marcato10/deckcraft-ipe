@@ -164,6 +164,27 @@ pub(super) fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf:
             if g.vertical { (Point::new(g.pos, g.from), Point::new(g.pos, g.to)) } else { (Point::new(g.from, g.pos), Point::new(g.to, g.pos)) };
         painter.add(egui::Shape::dashed_line(&[xf.to_screen(a), xf.to_screen(b)], Stroke::new(1.0, t.guide), 5.0, 3.0));
     }
+    // Equal-gap spacing: a short line across the gap and its distance in points (the model is in
+    // points, so the label doesn't lie at another zoom).
+    for sp in &app.session.tool.spacing {
+        let (a, b) = if sp.vertical {
+            (xf.to_screen(Point::new(sp.a, sp.at)), xf.to_screen(Point::new(sp.b, sp.at)))
+        } else {
+            (xf.to_screen(Point::new(sp.at, sp.a)), xf.to_screen(Point::new(sp.at, sp.b)))
+        };
+        painter.line_segment([a, b], Stroke::new(1.0, t.guide));
+        let galley = painter.layout_no_wrap(format!("{:.1} pt", sp.gap), theme::font(11.0), t.text);
+        let mid = pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+        // Above the line when it is horizontal, beside it when it is vertical, on a card so the
+        // number stays readable over the slide's content.
+        let at = if sp.vertical {
+            pos2(mid.x - galley.size().x / 2.0, mid.y - galley.size().y - 4.0)
+        } else {
+            pos2(mid.x + 6.0, mid.y - galley.size().y / 2.0)
+        };
+        painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(2.0), CornerRadius::same(3), t.card);
+        painter.galley(at, galley, t.text);
+    }
     if let Some(m) = app.session.tool.marquee {
         let r = Rect::from_two_pos(xf.to_screen(Point::new(m.x0, m.y0)), xf.to_screen(Point::new(m.x1, m.y1)));
         painter.rect(
