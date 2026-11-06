@@ -1,6 +1,18 @@
 use super::hit::table_rows;
 use super::{Drag, Guide, HistoryEntry, Point, Rect, Result, Session, Shape, ShapeId, ShapeKind, ToolKind, Value, Vec2, Xfrm, cmd, json, xfrm_of};
 
+/// Priority of a snap candidate: neighbouring shape (0) > manual guide (1) > slide (2).
+/// Lowest wins, so on a `|d|` tie adjacency beats the slide's magnets (Bug B).
+fn cand_prio(is_slide: bool, is_manual: bool) -> u8 {
+    if is_slide {
+        2
+    } else if is_manual {
+        1
+    } else {
+        0
+    }
+}
+
 impl Session {
     /// End the freeform being drawn: create the shape (if it has at least two points).
     pub fn finish_freeform(&mut self, closed: bool) -> Result<Value> {
@@ -146,22 +158,22 @@ impl Session {
             return (Vec2::ZERO, vec![]);
         }
         let size = st.doc.slide_size;
-        let mut xs: Vec<(f64, Rect)> = vec![
-            (0.0, Rect::new(0.0, 0.0, 0.0, size.height)),
-            (size.width / 2.0, Rect::new(size.width / 2.0, 0.0, size.width / 2.0, size.height)),
-            (size.width, Rect::new(size.width, 0.0, size.width, size.height)),
+        let mut xs2: Vec<(f64, Rect, u8)> = vec![
+            (0.0, Rect::new(0.0, 0.0, 0.0, size.height), cand_prio(true, false)),
+            (size.width / 2.0, Rect::new(size.width / 2.0, 0.0, size.width / 2.0, size.height), cand_prio(true, false)),
+            (size.width, Rect::new(size.width, 0.0, size.width, size.height), cand_prio(true, false)),
         ];
-        let mut ys: Vec<(f64, Rect)> = vec![
-            (0.0, Rect::new(0.0, 0.0, size.width, 0.0)),
-            (size.height / 2.0, Rect::new(0.0, size.height / 2.0, size.width, size.height / 2.0)),
-            (size.height, Rect::new(0.0, size.height, size.width, size.height)),
+        let mut ys2: Vec<(f64, Rect, u8)> = vec![
+            (0.0, Rect::new(0.0, 0.0, size.width, 0.0), cand_prio(true, false)),
+            (size.height / 2.0, Rect::new(0.0, size.height / 2.0, size.width, size.height / 2.0), cand_prio(true, false)),
+            (size.height, Rect::new(0.0, size.height, size.width, size.height), cand_prio(true, false)),
         ];
         if self.tool.guides_visible {
             for g in &st.doc.guides {
                 if g.vertical {
-                    xs.push((g.pos, Rect::new(g.pos, 0.0, g.pos, size.height)));
+                    xs2.push((g.pos, Rect::new(g.pos, 0.0, g.pos, size.height), cand_prio(false, true)));
                 } else {
-                    ys.push((g.pos, Rect::new(0.0, g.pos, size.width, g.pos)));
+                    ys2.push((g.pos, Rect::new(0.0, g.pos, size.width, g.pos), cand_prio(false, true)));
                 }
             }
         }
@@ -171,33 +183,33 @@ impl Session {
             }
             let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
             for x in [b.x0, b.center().x, b.x1] {
-                xs.push((x, b));
+                xs2.push((x, b, cand_prio(false, false)));
             }
             for y in [b.y0, b.center().y, b.y1] {
-                ys.push((y, b));
+                ys2.push((y, b, cand_prio(false, false)));
             }
         }
-        let mut best_x: Option<(f64, f64, Rect)> = None;
+        let mut best_x: Option<(f64, f64, Rect, u8)> = None;
         for edge in [r.x0, r.center().x, r.x1].into_iter().zip(xs_on).filter_map(|(e, on)| on.then_some(e)) {
-            for (x, b) in &xs {
-                let d = x - edge;
-                if d.abs() <= tol && best_x.is_none_or(|(bd, _, _)| d.abs() < bd.abs()) {
-                    best_x = Some((d, *x, *b));
+            for (x, b, pri) in &xs2 {
+                let d = *x - edge;
+                if d.abs() <= tol && best_x.is_none_or(|(bd, _, _, bp)| (*pri, d.abs()) < (bp, bd.abs())) {
+                    best_x = Some((d, *x, *b, *pri));
                 }
             }
         }
-        let mut best_y: Option<(f64, f64, Rect)> = None;
+        let mut best_y: Option<(f64, f64, Rect, u8)> = None;
         for edge in [r.y0, r.center().y, r.y1].into_iter().zip(ys_on).filter_map(|(e, on)| on.then_some(e)) {
-            for (y, b) in &ys {
-                let d = y - edge;
-                if d.abs() <= tol && best_y.is_none_or(|(bd, _, _)| d.abs() < bd.abs()) {
-                    best_y = Some((d, *y, *b));
+            for (y, b, pri) in &ys2 {
+                let d = *y - edge;
+                if d.abs() <= tol && best_y.is_none_or(|(bd, _, _, bp)| (*pri, d.abs()) < (bp, bd.abs())) {
+                    best_y = Some((d, *y, *b, *pri));
                 }
             }
         }
         let mut off = Vec2::ZERO;
         let mut guides = vec![];
-        if let Some((d, x, b)) = best_x {
+        if let Some((d, x, b, _)) = best_x {
             off.x = d;
             let rr = r + Vec2::new(d, 0.0);
             guides.push(Guide { vertical: true, pos: x, from: b.y0.min(rr.y0), to: b.y1.max(rr.y1) });
@@ -211,7 +223,7 @@ impl Session {
             };
             off.x = deckcraft_geom::snap(at, self.prefs.grid_spacing) - at;
         }
-        if let Some((d, y, b)) = best_y {
+        if let Some((d, y, b, _)) = best_y {
             off.y = d;
             let rr = r + Vec2::new(0.0, d);
             guides.push(Guide { vertical: false, pos: y, from: b.x0.min(rr.x0), to: b.x1.max(rr.x1) });
