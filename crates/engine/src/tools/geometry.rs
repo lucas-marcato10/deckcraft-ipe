@@ -23,21 +23,39 @@ struct SnapEdges {
     spacing: bool,
 }
 
+/// A box edge by index: `0` = start, `1` = centre, `2` = end.
+fn edge_x(r: Rect, i: usize) -> f64 {
+    match i {
+        0 => r.x0,
+        1 => r.center().x,
+        _ => r.x1,
+    }
+}
+
+/// `edge_x` on the other axis.
+fn edge_y(r: Rect, i: usize) -> f64 {
+    match i {
+        0 => r.y0,
+        1 => r.center().y,
+        _ => r.y1,
+    }
+}
+
 /// Até 2 linhas distintas (|Δpos| > 1e-6) que continuam EXATAS depois do offset escolhido.
 /// `hits` vem ordenado por `(prio, |d|)` — o primeiro é o vencedor do snap.
-fn pick_wins(hits: &[(f64, f64, u8)]) -> Vec<(f64, f64, u8)> {
-    let mut wins: Vec<(f64, f64, u8)> = vec![];
-    for &(d, pos, pri) in hits {
+fn pick_wins(hits: &[(f64, f64, u8, usize)]) -> Vec<(f64, f64, u8, usize)> {
+    let mut wins: Vec<(f64, f64, u8, usize)> = vec![];
+    for &(d, pos, pri, ei) in hits {
         if wins.len() == 2 {
             break;
         }
         match wins.first() {
-            None => wins.push((d, pos, pri)),
+            None => wins.push((d, pos, pri, ei)),
             // Só mostra a segunda linha se ela também fica exata com o MESMO offset;
             // uma guia a 0.5 pt da borda mente (goal: "não mentir").
-            Some(&(best_d, _, _)) => {
+            Some(&(best_d, _, _, _)) => {
                 if (d - best_d).abs() <= 1e-6 && !wins.iter().any(|w| (w.1 - pos).abs() <= 1e-6) {
-                    wins.push((d, pos, pri));
+                    wins.push((d, pos, pri, ei));
                 }
             }
         }
@@ -177,7 +195,7 @@ impl Session {
 
     /// Smart guides: snap `r` edges/centres to the slide and other shapes. Returns the offset to
     /// apply, the guides to draw and the equal-gap measurements to label.
-    pub(super) fn snap_rect(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool) -> (Vec2, Vec<Guide>, Vec<Spacing>) {
+    pub(super) fn snap_rect(&mut self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool) -> (Vec2, Vec<Guide>, Vec<Spacing>) {
         self.snap_edges(r, exclude, tol, enabled, SnapEdges { xs_on: [true; 3], ys_on: [true; 3], spacing: true })
     }
 
@@ -286,7 +304,7 @@ impl Session {
     /// top, centre, bottom. Resizing passes just the edges being dragged, so a fixed edge that
     /// already sits on a line (distance 0) doesn't win and leave the dragged edge unsnapped.
     /// `spacing` is off for a resize: equal gaps only make sense for a whole box that moves.
-    fn snap_edges(&self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool, edges: SnapEdges) -> (Vec2, Vec<Guide>, Vec<Spacing>) {
+    fn snap_edges(&mut self, r: Rect, exclude: &[ShapeId], tol: f64, enabled: bool, edges: SnapEdges) -> (Vec2, Vec<Guide>, Vec<Spacing>) {
         let SnapEdges { xs_on, ys_on, spacing } = edges;
         let Some(st) = self.active() else { return (Vec2::ZERO, vec![], vec![]) };
         if !enabled || !self.prefs.smart_guides {
@@ -318,34 +336,53 @@ impl Session {
                 ys2.push((y, cand_prio(false, false)));
             }
         }
-        let mut hits_x: Vec<(f64, f64, u8)> = vec![]; // (d, pos, prio)
-        for edge in [r.x0, r.center().x, r.x1].into_iter().zip(xs_on).filter_map(|(e, on)| on.then_some(e)) {
+        let mut hits_x: Vec<(f64, f64, u8, usize)> = vec![]; // (d, pos, prio, edge)
+        for (ei, edge) in [r.x0, r.center().x, r.x1].into_iter().zip(xs_on).enumerate().filter_map(|(ei, (e, on))| on.then_some((ei, e))) {
             for (x, pri) in &xs2 {
                 let d = *x - edge;
                 if d.abs() <= tol {
-                    hits_x.push((d, *x, *pri));
+                    hits_x.push((d, *x, *pri, ei));
                 }
             }
         }
         hits_x.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.abs().total_cmp(&b.0.abs())));
-        let wins_x = pick_wins(&hits_x);
-        let mut hits_y: Vec<(f64, f64, u8)> = vec![]; // (d, pos, prio)
-        for edge in [r.y0, r.center().y, r.y1].into_iter().zip(ys_on).filter_map(|(e, on)| on.then_some(e)) {
+        let mut wins_x = pick_wins(&hits_x);
+        // A live hold wins its axis outright: it beats a nearer line (temporal hysteresis).
+        if let Some((hpos, hedge)) = self.tool.snap_hold.0 {
+            let d = hpos - edge_x(r, hedge);
+            if xs_on.get(hedge).copied().unwrap_or(false) && d.abs() <= tol * 1.6 {
+                wins_x = vec![(d, hpos, 0, hedge)];
+            } else {
+                self.tool.snap_hold.0 = None;
+            }
+        }
+        self.tool.snap_hold.0 = wins_x.first().map(|&(_, pos, _, ei)| (pos, ei));
+        let mut hits_y: Vec<(f64, f64, u8, usize)> = vec![]; // (d, pos, prio, edge)
+        for (ei, edge) in [r.y0, r.center().y, r.y1].into_iter().zip(ys_on).enumerate().filter_map(|(ei, (e, on))| on.then_some((ei, e))) {
             for (y, pri) in &ys2 {
                 let d = *y - edge;
                 if d.abs() <= tol {
-                    hits_y.push((d, *y, *pri));
+                    hits_y.push((d, *y, *pri, ei));
                 }
             }
         }
         hits_y.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.abs().total_cmp(&b.0.abs())));
-        let wins_y = pick_wins(&hits_y);
+        let mut wins_y = pick_wins(&hits_y);
+        if let Some((hpos, hedge)) = self.tool.snap_hold.1 {
+            let d = hpos - edge_y(r, hedge);
+            if ys_on.get(hedge).copied().unwrap_or(false) && d.abs() <= tol * 1.6 {
+                wins_y = vec![(d, hpos, 0, hedge)];
+            } else {
+                self.tool.snap_hold.1 = None;
+            }
+        }
+        self.tool.snap_hold.1 = wins_y.first().map(|&(_, pos, _, ei)| (pos, ei));
         let mut off = Vec2::ZERO;
         let mut guides = vec![];
         let mut spacings: Vec<Spacing> = vec![];
-        if let Some(&(d, _, _)) = wins_x.first() {
+        if let Some(&(d, _, _, _)) = wins_x.first() {
             off.x = d;
-            for &(_, pos, _) in &wins_x {
+            for &(_, pos, _, _) in &wins_x {
                 guides.push(Guide { vertical: true, pos, from: 0.0, to: size.height });
             }
         } else if spacing && let Some((dx, sp)) = self.spacing_shift_x(r, exclude, tol) {
@@ -363,9 +400,9 @@ impl Session {
             };
             off.x = deckcraft_geom::snap(at, self.prefs.grid_spacing) - at;
         }
-        if let Some(&(d, _, _)) = wins_y.first() {
+        if let Some(&(d, _, _, _)) = wins_y.first() {
             off.y = d;
-            for &(_, pos, _) in &wins_y {
+            for &(_, pos, _, _) in &wins_y {
                 guides.push(Guide { vertical: false, pos, from: 0.0, to: size.width });
             }
         } else if spacing && let Some((dy, sp)) = self.spacing_shift_y(r, exclude, tol) {
@@ -389,6 +426,7 @@ impl Session {
         if x.rot != 0.0 {
             self.tool.guides.clear();
             self.tool.spacing.clear();
+            self.tool.snap_hold = (None, None);
             return x;
         }
         let r = x.rect();

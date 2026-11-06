@@ -279,6 +279,10 @@ pub struct ToolState {
     /// Equal-gap spacing of the move in progress, at most one per axis. Transient UI state (like
     /// `guides`), so `Guide`'s serialized shape stays untouched.
     pub spacing: Vec<Spacing>,
+    /// The snapped line this drag is holding on to (temporal hysteresis), per axis: `(position,
+    /// edge)` with edge `0 = start, 1 = centre, 2 = end`. `None` = no hold on that axis. Transient:
+    /// cleared at the start and at the end of every gesture (`ToolState` is not serialized).
+    pub snap_hold: (Option<(f64, usize)>, Option<(f64, usize)>),
     pub hover: Option<Hit>,
     pub ink_preview: Vec<(f64, f64, f32)>,
     /// Connection sites to show (slide coordinates) while drawing or dragging a line end, and the

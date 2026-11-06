@@ -7158,3 +7158,99 @@ fn move_snaps_the_bounds_not_the_pressed_spot() {
         s.execute("edit.delete", &json!({"ids": [id]})).unwrap();
     }
 }
+
+/// Presa não troca por 1pt melhor: presa em 300, a linha de 304 não rouba; só depois de soltar.
+#[test]
+fn snap_hysteresis_does_not_switch_to_a_nearer_line_while_held() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 200.0, 80.0, 80.0]})).unwrap();
+    // Estreita (20) de propósito: o cx/x1 dela ficam longe e não entram na disputa.
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [304.0, 200.0, 20.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, x: f64| PointerEvent { kind, x, y: 140.0, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, 150.0)).unwrap();
+    // Cru x0=298: 2pt de 300 (gruda), 6pt de 304 (fora de 4.5).
+    s.pointer(ev(PointerKind::Drag, 348.0)).unwrap();
+    assert_eq!(box_of(&mut s, id)["x"], 300.0);
+    // Cru x0=302.5: sem histerese a linha de 304 venceria (1.5 < 2.5); preso, fica em 300.
+    s.pointer(ev(PointerKind::Drag, 352.5)).unwrap();
+    assert_eq!(box_of(&mut s, id)["x"], 300.0, "presa não troca por 1pt melhor");
+    assert!(s.tool.guides.iter().any(|g| g.vertical && g.pos == 300.0));
+    // Cru x0=308: 8 > 7.2 — solta, re-avalia e gruda na de 304 (4 <= 4.5).
+    s.pointer(ev(PointerKind::Drag, 358.0)).unwrap();
+    assert_eq!(box_of(&mut s, id)["x"], 304.0, "soltou e re-grudou na mais perto");
+    s.pointer(ev(PointerKind::Up, 358.0)).unwrap();
+    assert_eq!(s.tool.snap_hold, (None, None), "Up limpa a presa");
+}
+
+/// A histerese é por eixo: o mesmo threshold duplo vale para a guia horizontal (Y).
+#[test]
+fn snap_hysteresis_holds_the_horizontal_guide_too() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    // Vizinho com y0 = 430; o móvel (x=430..510) não tem candidato em X.
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 430.0, 80.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [430.0, 100.0, 80.0, 50.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, y: f64| PointerEvent { kind, x: 470.0, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, 125.0)).unwrap();
+    for raw_y0 in [427.0, 436.0] {
+        s.pointer(ev(PointerKind::Drag, raw_y0 + 25.0)).unwrap();
+        assert_eq!(box_of(&mut s, id)["y"], 430.0, "cru y0={raw_y0}: preso em 430");
+    }
+    // 438 = 430 + 8 > 7.2: solta e fica cru.
+    s.pointer(ev(PointerKind::Drag, 463.0)).unwrap();
+    assert_eq!(box_of(&mut s, id)["y"], 438.0, "além de 7.2 solta no eixo Y");
+    s.pointer(ev(PointerKind::Up, 463.0)).unwrap();
+}
+
+/// Presa de um gesto anterior não vaza para o próximo move (API que não mandou o Up).
+#[test]
+fn snap_hysteresis_forgets_a_stale_hold_when_a_new_move_starts() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 100.0, 80.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 430.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    // Presa velha em 300, como se o gesto anterior tivesse terminado sem Up.
+    s.tool.snap_hold = (Some((300.0, 0)), None);
+    let ev = |kind, x: f64| PointerEvent { kind, x, y: 470.0, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, 150.0)).unwrap();
+    // Cru x0=306: 6 pt da presa velha (dentro de 7.2), mas 6 > 4.5 dos candidatos reais.
+    s.pointer(ev(PointerKind::Drag, 356.0)).unwrap();
+    assert_eq!(box_of(&mut s, id)["x"], 306.0, "presa velha tinha que ser esquecida no começo do move");
+    s.pointer(ev(PointerKind::Up, 356.0)).unwrap();
+}
+
+/// Histerese: grudado em 300, o move fica preso até 1.6*tol (4.5*1.6 = 7.2) e só então solta.
+#[test]
+fn snap_hysteresis_keeps_the_guide_until_the_exit_threshold() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    // Vizinho com x0 = 300, fora da linha do móvel em Y (o slide é 960x540: um y0/y1/centro em
+    // 0/270/540, ou perto dos placeholders Title/Subtitle, deixaria uma guia horizontal e o
+    // `guides.is_empty()` abaixo mediria outra coisa).
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 100.0, 80.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 430.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, x: f64| PointerEvent { kind, x, y: 470.0, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, 150.0)).unwrap();
+    // press em x=150: p.x = cru_x0 + 50 deixa a x0 crua em cru_x0. tol do snap = 3.0*1.5 = 4.5.
+    for raw_x0 in [297.0, 302.0, 306.0] {
+        s.pointer(ev(PointerKind::Drag, raw_x0 + 50.0)).unwrap();
+        assert_eq!(box_of(&mut s, id)["x"], 300.0, "cru x0={raw_x0}: preso em 300");
+        assert!(s.tool.guides.iter().any(|g| g.vertical && g.pos == 300.0), "cru x0={raw_x0}: {:?}", s.tool.guides);
+    }
+    // 308 = 300 + 8 > 7.2: solta e fica cru (nenhum candidato em 4.5).
+    s.pointer(ev(PointerKind::Drag, 358.0)).unwrap();
+    assert_eq!(box_of(&mut s, id)["x"], 308.0, "além de 7.2 solta");
+    assert!(s.tool.guides.is_empty(), "guias: {:?}", s.tool.guides);
+    s.pointer(ev(PointerKind::Up, 358.0)).unwrap();
+    assert_eq!(s.tool.snap_hold, (None, None), "Up limpa a presa");
+}

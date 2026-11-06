@@ -208,6 +208,8 @@ impl Session {
         }
         if !moved {
             self.begin(if duplicate { "Duplicate" } else { "Move" });
+            // A new gesture starts with no line held: the previous drag's hold is stale.
+            self.tool.snap_hold = (None, None);
             if duplicate {
                 // Alt-drag: drag a copy, leave the original.
                 self.execute_dup_in_place(&ids)?;

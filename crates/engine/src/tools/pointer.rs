@@ -446,6 +446,7 @@ impl Session {
         let drag = self.tool.drag.take();
         self.tool.guides.clear();
         self.tool.spacing.clear();
+        self.tool.snap_hold = (None, None);
         self.tool.sites.clear();
         self.tool.glue = None;
         let mut out = Value::Null;
