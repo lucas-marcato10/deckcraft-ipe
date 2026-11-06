@@ -7053,3 +7053,30 @@ fn move_prefers_neighbor_over_slide_center_on_tie() {
     let b = box_of(&mut s, id);
     assert_eq!(b["x"], cx - 8.0, "era para encostar no vizinho (cx - 8), não no centro do slide (cx = {cx}): {b}");
 }
+
+/// Multi-win: quando left e right do móvel alinham ao mesmo tempo (x=100 e x=200),
+/// as DUAS guias verticais aparecem, e cada uma é full-span (0..slide.height).
+#[test]
+fn smart_guides_show_both_edges_when_both_align() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    // A: [0..100], B: [200..300]; C (móvel, w=100) em [103..203], arrastado 3 pt à esquerda.
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [0.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [200.0, 100.0, 100.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [103.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    // Guias só existem durante o drag (Up limpa em pointer.rs:447): Down → Drag → Drag → LÊ → Up.
+    let ev = |kind, (x, y): (f64, f64)| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, (153.0, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (151.5, 140.0))).unwrap(); // 1.5 < tol: no-op, espelha o drag_gesture
+    s.pointer(ev(PointerKind::Drag, (150.0, 140.0))).unwrap(); // C fica em [100..200]
+    let xs: Vec<f64> = s.tool.guides.iter().filter(|g| g.vertical).map(|g| g.pos).collect();
+    assert!(xs.contains(&100.0) && xs.contains(&200.0), "esperava x=100 e x=200, guias: {xs:?}");
+    assert_eq!(xs.len(), 2, "esperava exatamente 2 guias verticais, veio: {xs:?}");
+    let h = s.doc().unwrap().doc.slide_size.height;
+    for g in s.tool.guides.iter().filter(|g| g.vertical) {
+        assert!(g.from <= 0.01 && g.to >= h - 0.01, "guia curta {g:?}, altura {h}");
+    }
+    s.pointer(ev(PointerKind::Up, (150.0, 140.0))).unwrap();
+}
