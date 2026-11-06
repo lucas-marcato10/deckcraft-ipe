@@ -13,6 +13,28 @@ fn cand_prio(is_slide: bool, is_manual: bool) -> u8 {
     }
 }
 
+/// Até 2 linhas distintas (|Δpos| > 1e-6) que continuam EXATAS depois do offset escolhido.
+/// `hits` vem ordenado por `(prio, |d|)` — o primeiro é o vencedor do snap.
+fn pick_wins(hits: &[(f64, f64, u8)]) -> Vec<(f64, f64, u8)> {
+    let mut wins: Vec<(f64, f64, u8)> = vec![];
+    for &(d, pos, pri) in hits {
+        if wins.len() == 2 {
+            break;
+        }
+        match wins.first() {
+            None => wins.push((d, pos, pri)),
+            // Só mostra a segunda linha se ela também fica exata com o MESMO offset;
+            // uma guia a 0.5 pt da borda mente (goal: "não mentir").
+            Some(&(best_d, _, _)) => {
+                if (d - best_d).abs() <= 1e-6 && !wins.iter().any(|w| (w.1 - pos).abs() <= 1e-6) {
+                    wins.push((d, pos, pri));
+                }
+            }
+        }
+    }
+    wins
+}
+
 impl Session {
     /// End the freeform being drawn: create the shape (if it has at least two points).
     pub fn finish_freeform(&mut self, closed: bool) -> Result<Value> {
@@ -158,22 +180,16 @@ impl Session {
             return (Vec2::ZERO, vec![]);
         }
         let size = st.doc.slide_size;
-        let mut xs2: Vec<(f64, Rect, u8)> = vec![
-            (0.0, Rect::new(0.0, 0.0, 0.0, size.height), cand_prio(true, false)),
-            (size.width / 2.0, Rect::new(size.width / 2.0, 0.0, size.width / 2.0, size.height), cand_prio(true, false)),
-            (size.width, Rect::new(size.width, 0.0, size.width, size.height), cand_prio(true, false)),
-        ];
-        let mut ys2: Vec<(f64, Rect, u8)> = vec![
-            (0.0, Rect::new(0.0, 0.0, size.width, 0.0), cand_prio(true, false)),
-            (size.height / 2.0, Rect::new(0.0, size.height / 2.0, size.width, size.height / 2.0), cand_prio(true, false)),
-            (size.height, Rect::new(0.0, size.height, size.width, size.height), cand_prio(true, false)),
-        ];
+        let mut xs2: Vec<(f64, u8)> =
+            vec![(0.0, cand_prio(true, false)), (size.width / 2.0, cand_prio(true, false)), (size.width, cand_prio(true, false))];
+        let mut ys2: Vec<(f64, u8)> =
+            vec![(0.0, cand_prio(true, false)), (size.height / 2.0, cand_prio(true, false)), (size.height, cand_prio(true, false))];
         if self.tool.guides_visible {
             for g in &st.doc.guides {
                 if g.vertical {
-                    xs2.push((g.pos, Rect::new(g.pos, 0.0, g.pos, size.height), cand_prio(false, true)));
+                    xs2.push((g.pos, cand_prio(false, true)));
                 } else {
-                    ys2.push((g.pos, Rect::new(0.0, g.pos, size.width, g.pos), cand_prio(false, true)));
+                    ys2.push((g.pos, cand_prio(false, true)));
                 }
             }
         }
@@ -183,36 +199,41 @@ impl Session {
             }
             let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
             for x in [b.x0, b.center().x, b.x1] {
-                xs2.push((x, b, cand_prio(false, false)));
+                xs2.push((x, cand_prio(false, false)));
             }
             for y in [b.y0, b.center().y, b.y1] {
-                ys2.push((y, b, cand_prio(false, false)));
+                ys2.push((y, cand_prio(false, false)));
             }
         }
-        let mut best_x: Option<(f64, f64, Rect, u8)> = None;
+        let mut hits_x: Vec<(f64, f64, u8)> = vec![]; // (d, pos, prio)
         for edge in [r.x0, r.center().x, r.x1].into_iter().zip(xs_on).filter_map(|(e, on)| on.then_some(e)) {
-            for (x, b, pri) in &xs2 {
+            for (x, pri) in &xs2 {
                 let d = *x - edge;
-                if d.abs() <= tol && best_x.is_none_or(|(bd, _, _, bp)| (*pri, d.abs()) < (bp, bd.abs())) {
-                    best_x = Some((d, *x, *b, *pri));
+                if d.abs() <= tol {
+                    hits_x.push((d, *x, *pri));
                 }
             }
         }
-        let mut best_y: Option<(f64, f64, Rect, u8)> = None;
+        hits_x.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.abs().total_cmp(&b.0.abs())));
+        let wins_x = pick_wins(&hits_x);
+        let mut hits_y: Vec<(f64, f64, u8)> = vec![]; // (d, pos, prio)
         for edge in [r.y0, r.center().y, r.y1].into_iter().zip(ys_on).filter_map(|(e, on)| on.then_some(e)) {
-            for (y, b, pri) in &ys2 {
+            for (y, pri) in &ys2 {
                 let d = *y - edge;
-                if d.abs() <= tol && best_y.is_none_or(|(bd, _, _, bp)| (*pri, d.abs()) < (bp, bd.abs())) {
-                    best_y = Some((d, *y, *b, *pri));
+                if d.abs() <= tol {
+                    hits_y.push((d, *y, *pri));
                 }
             }
         }
+        hits_y.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.abs().total_cmp(&b.0.abs())));
+        let wins_y = pick_wins(&hits_y);
         let mut off = Vec2::ZERO;
         let mut guides = vec![];
-        if let Some((d, x, b, _)) = best_x {
+        if let Some(&(d, _, _)) = wins_x.first() {
             off.x = d;
-            let rr = r + Vec2::new(d, 0.0);
-            guides.push(Guide { vertical: true, pos: x, from: b.y0.min(rr.y0), to: b.y1.max(rr.y1) });
+            for &(_, pos, _) in &wins_x {
+                guides.push(Guide { vertical: true, pos, from: 0.0, to: size.height });
+            }
         } else if self.prefs.snap_to_grid && xs_on.contains(&true) {
             let at = if xs_on[0] {
                 r.x0
@@ -223,10 +244,11 @@ impl Session {
             };
             off.x = deckcraft_geom::snap(at, self.prefs.grid_spacing) - at;
         }
-        if let Some((d, y, b, _)) = best_y {
+        if let Some(&(d, _, _)) = wins_y.first() {
             off.y = d;
-            let rr = r + Vec2::new(0.0, d);
-            guides.push(Guide { vertical: false, pos: y, from: b.x0.min(rr.x0), to: b.x1.max(rr.x1) });
+            for &(_, pos, _) in &wins_y {
+                guides.push(Guide { vertical: false, pos, from: 0.0, to: size.width });
+            }
         } else if self.prefs.snap_to_grid && ys_on.contains(&true) {
             let at = if ys_on[0] {
                 r.y0
