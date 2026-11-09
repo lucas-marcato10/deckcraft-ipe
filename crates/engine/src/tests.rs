@@ -1063,6 +1063,99 @@ fn reflow_trigger_gap_change_moves_every_child() {
     assert!((box_of(&mut s, g)["w"].as_f64().unwrap() - (80.0 + 60.0 + 60.0)).abs() < 1e-6);
 }
 
+/// Two 80×40 and 60×30 rects on a blank slide, grouped; the group id.
+fn autolayout_scene(s: &mut Session) -> (u64, u64, u64) {
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 80.0, 40.0]})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 200.0, 60.0, 30.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [a, b]})).unwrap();
+    let g = s.execute("arrange.group", &json!({})).unwrap()["id"].as_u64().unwrap();
+    (a, b, g)
+}
+
+/// `arrange.autoLayout` is how the UI and MCP turn Auto Layout on: it sets the group's
+/// gap/padding/direction and the edit's reflow places its children at once, in one undo step.
+#[test]
+fn autolayout_command_sets_gap_and_reflows() {
+    let mut s = session();
+    let (a, b, g) = autolayout_scene(&mut s);
+    let r = s.execute("arrange.autoLayout", &json!({"gap": 20.0, "direction": "horizontal"})).unwrap();
+    assert_eq!(r["id"].as_u64(), Some(g), "{r}");
+    assert_eq!(r["layout"]["gap"], 20.0, "{r}");
+    assert_eq!(r["layout"]["padding"], json!([0.0, 0.0, 0.0, 0.0]), "{r}");
+    assert_eq!(r["layout"]["direction"], "horizontal", "{r}");
+    let v = s.execute("shape.inspect", &json!({"id": g})).unwrap();
+    assert_eq!(v["shape"]["layout"]["gap"], 20.0, "{v}");
+    assert_eq!(v["shape"]["layout"]["direction"], "horizontal", "{v}");
+    let a_box = box_of(&mut s, a);
+    let b_box = box_of(&mut s, b);
+    let (ax, aw) = (a_box["x"].as_f64().unwrap(), a_box["w"].as_f64().unwrap());
+    let bx = b_box["x"].as_f64().unwrap();
+    assert!((bx - (ax + aw + 20.0)).abs() < 1e-6, "a={a_box} b={b_box}");
+    assert!((b_box["y"].as_f64().unwrap() - a_box["y"].as_f64().unwrap()).abs() < 1e-6, "{a_box} {b_box}");
+    // One gesture, one undo step: the layout and the reflow go back together.
+    s.execute("edit.undo", &json!({})).unwrap();
+    let v = s.execute("shape.inspect", &json!({"id": g})).unwrap();
+    assert!(v["shape"]["layout"].is_null(), "{v}");
+    assert!((box_of(&mut s, b)["x"].as_f64().unwrap() - 300.0).abs() < 1e-6);
+}
+
+#[test]
+fn autolayout_command_rejects_bad_params() {
+    let mut s = session();
+    let (_a, _b, g) = autolayout_scene(&mut s);
+    for bad in [
+        json!({"gap": -1.0}),
+        json!({"gap": "20"}),
+        json!({"padding": [-1.0, 0.0, 0.0, 0.0]}),
+        json!({"padding": [0.0, 0.0, 0.0]}),
+        // JSON has no NaN; a non-number in its place is refused the same way.
+        json!({"padding": [0.0, 0.0, 0.0, null]}),
+        json!({"padding": {"top": 1.0}}),
+        json!({"padding": {"top": 1.0, "right": 2.0, "bottom": 3.0, "left": -4.0}}),
+        json!({"direction": "diagonal"}),
+        json!({"direction": 3}),
+        json!({"on": "yes"}),
+    ] {
+        let before = s.doc().unwrap().revision;
+        let err = s.execute("arrange.autoLayout", &bad).unwrap_err().to_string();
+        assert!(err.contains("arrange.autoLayout"), "{bad}: {err}");
+        assert_eq!(s.doc().unwrap().revision, before, "{bad}: a refused command changes nothing");
+    }
+    assert!(s.execute("shape.inspect", &json!({"id": g})).unwrap()["shape"]["layout"].is_null());
+    // A selection without a group is refused with a message that says what to select.
+    let c = s.execute("shape.insert", &json!({"preset": "rect", "rect": [10.0, 10.0, 20.0, 20.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [c]})).unwrap();
+    let err = s.execute("arrange.autoLayout", &json!({"gap": 4.0})).unwrap_err().to_string();
+    assert!(err.contains("group"), "{err}");
+}
+
+#[test]
+fn autolayout_command_off_clears_layout() {
+    let mut s = session();
+    let (a, _b, g) = autolayout_scene(&mut s);
+    // The array form of `padding` is [top, right, bottom, left], and the flow insets the first
+    // child by the left/top edges.
+    s.execute("arrange.autoLayout", &json!({"gap": 12.0, "padding": [1.0, 2.0, 3.0, 4.0], "direction": "vertical"})).unwrap();
+    let v = s.execute("shape.inspect", &json!({"id": g})).unwrap();
+    assert_eq!(v["shape"]["layout"]["padding"], json!([1.0, 2.0, 3.0, 4.0]), "{v}");
+    assert_eq!(v["shape"]["layout"]["direction"], "vertical", "{v}");
+    assert!((box_of(&mut s, a)["x"].as_f64().unwrap() - (v["box"]["x"].as_f64().unwrap() + 4.0)).abs() < 1e-6, "{v}");
+    // The object form names the same sides; the flow re-runs in the same edit.
+    s.execute(
+        "arrange.autoLayout",
+        &json!({"gap": 12.0, "padding": {"top": 10.0, "right": 20.0, "bottom": 30.0, "left": 40.0}, "direction": "vertical"}),
+    )
+    .unwrap();
+    let v = s.execute("shape.inspect", &json!({"id": g})).unwrap();
+    assert_eq!(v["shape"]["layout"]["padding"], json!([10.0, 20.0, 30.0, 40.0]), "{v}");
+    let r = s.execute("arrange.autoLayout", &json!({"on": false})).unwrap();
+    assert_eq!(r["id"].as_u64(), Some(g), "{r}");
+    assert!(r["layout"].is_null(), "{r}");
+    let v = s.execute("shape.inspect", &json!({"id": g})).unwrap();
+    assert!(v["shape"]["layout"].is_null(), "{v}");
+}
+
 #[test]
 fn align_and_distribute() {
     let mut s = session();

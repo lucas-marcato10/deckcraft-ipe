@@ -1,7 +1,7 @@
 //! Arrange: order, group, align, distribute, rotate and flip.
 
 use deckcraft_geom::{Point, Rect, Xfrm};
-use deckcraft_model::{Shape, ShapeId, ShapeKind};
+use deckcraft_model::{AutoLayout, LayoutDir, Shape, ShapeId, ShapeKind};
 use serde_json::{Value, json};
 
 use super::{
@@ -40,6 +40,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("arrange.group", "Group", ["Arrange"], Some("Cmd+Alt+G"), "{ids?}", has_two, group),
         cmd!("arrange.ungroup", "Ungroup", ["Arrange"], Some("Cmd+Alt+Shift+G"), "{ids?}", has_selection, ungroup),
         cmd!("arrange.regroup", "Regroup", ["Arrange"], Some("Cmd+Alt+J"), "{}", has_doc, regroup),
+        cmd!(
+            "arrange.autoLayout",
+            "Auto Layout",
+            ["Arrange"],
+            None,
+            "{gap?: pt (default 0), padding?: [top,right,bottom,left] pt or {top,right,bottom,left} pt (default 0), direction?: horizontal|vertical, on?: bool (false clears)} → {id, layout, ids}",
+            has_selection,
+            auto_layout
+        ),
         cmd!(
             "arrange.align",
             "Align",
@@ -227,6 +236,125 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
         sel.shapes = vec![id];
         Ok(json!({"id": id}))
     })
+}
+
+/// Auto Layout for the selected groups: set gap/padding/direction, or clear it with `on: false`.
+/// [`Session::edit`] reflows the changed containers before the undo entry is committed, so the
+/// children take their new places in the same step. Non-groups in the selection are ignored;
+/// selecting no group at all is an error, since there is nothing to flow.
+fn auto_layout(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "arrange.autoLayout";
+    let setting = auto_layout_param(p)?;
+    let ids = targets(s, p)?;
+    let st = s.doc()?;
+    let mut groups = vec![];
+    let mut locked = 0;
+    for id in &ids {
+        let Some(sh) = st.shape(*id) else { continue };
+        if !sh.is_group() {
+            continue;
+        }
+        if sh.locked {
+            locked += 1;
+        } else {
+            groups.push(*id);
+        }
+    }
+    let Some(&first) = groups.first() else {
+        return Err(bad(CMD, if locked > 0 { "the group is locked" } else { "select a group: Auto Layout arranges a group's objects" }));
+    };
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).ok_or_else(|| bad(CMD, "no slide"))?;
+        let mut applied = Vec::with_capacity(groups.len());
+        for id in &groups {
+            if let Some(sh) = deckcraft_model::find_shape_mut(shapes, *id) {
+                sh.layout = setting;
+                applied.push(*id);
+            }
+        }
+        if applied.is_empty() {
+            return Err(bad(CMD, "no such shape"));
+        }
+        let id = applied.first().copied().unwrap_or(first);
+        Ok(json!({"id": id, "layout": layout_json(setting), "ids": applied}))
+    })
+}
+
+/// The Auto Layout the params ask for, or `None` to turn it off. Unspecified fields take the
+/// defaults (no gap, no padding, horizontal), so every call sets a whole layout.
+fn auto_layout_param(p: &Value) -> Result<Option<AutoLayout>> {
+    const CMD: &str = "arrange.autoLayout";
+    let on = match p.get("on") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(on)) => Some(*on),
+        Some(_) => return Err(bad(CMD, "`on` is true or false")),
+    };
+    let gap = match p.get("gap") {
+        None | Some(Value::Null) => 0.0,
+        Some(v) => points(v, CMD, "gap")?,
+    };
+    let padding = padding_param(p)?.unwrap_or([0.0; 4]);
+    let direction = match p.get("direction") {
+        None | Some(Value::Null) => LayoutDir::Horizontal,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("horizontal") => LayoutDir::Horizontal,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("vertical") => LayoutDir::Vertical,
+        Some(Value::String(s)) => return Err(bad(CMD, format!("`direction` is horizontal or vertical, not {s:?}"))),
+        Some(_) => return Err(bad(CMD, "`direction` is \"horizontal\" or \"vertical\"")),
+    };
+    // `on: false` clears the layout; the other values were still checked above.
+    if on == Some(false) {
+        return Ok(None);
+    }
+    Ok(Some(AutoLayout { gap, padding, direction }))
+}
+
+/// A distance in points: a finite number, zero or more.
+fn points(v: &Value, cmd: &str, key: &str) -> Result<f64> {
+    let n = v.as_f64().ok_or_else(|| bad(cmd, format!("`{key}` is a number of points")))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err(bad(cmd, format!("`{key}` is zero or more points")));
+    }
+    Ok(n)
+}
+
+/// `padding` as [top, right, bottom, left], from an array of four or an object of named sides.
+fn padding_param(p: &Value) -> Result<Option<[f64; 4]>> {
+    const CMD: &str = "arrange.autoLayout";
+    let Some(v) = p.get("padding").filter(|v| !v.is_null()) else { return Ok(None) };
+    if let Some(a) = v.as_array() {
+        if a.len() != 4 {
+            return Err(bad(CMD, "`padding` takes four numbers: [top, right, bottom, left]"));
+        }
+        let mut pad = [0.0; 4];
+        for (slot, v) in pad.iter_mut().zip(a) {
+            *slot = points(v, CMD, "padding")?;
+        }
+        return Ok(Some(pad));
+    }
+    if let Some(o) = v.as_object() {
+        let mut pad = [0.0; 4];
+        for (slot, key) in pad.iter_mut().zip(["top", "right", "bottom", "left"]) {
+            let v = o.get(key).ok_or_else(|| bad(CMD, format!("`padding` is missing `{key}`")))?;
+            *slot = points(v, CMD, "padding")?;
+        }
+        return Ok(Some(pad));
+    }
+    Err(bad(CMD, "`padding` takes [top, right, bottom, left] or {top, right, bottom, left}"))
+}
+
+/// The answer's layout, in the shape the params use; `null` when Auto Layout is off.
+fn layout_json(l: Option<AutoLayout>) -> Value {
+    match l {
+        Some(l) => json!({
+            "gap": l.gap,
+            "padding": l.padding,
+            "direction": match l.direction {
+                LayoutDir::Horizontal => "horizontal",
+                LayoutDir::Vertical => "vertical",
+            },
+        }),
+        None => Value::Null,
+    }
 }
 
 /// After an edit: refit every group whose children's geometry changed to the union of its
