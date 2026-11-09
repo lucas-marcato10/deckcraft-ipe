@@ -11,7 +11,7 @@
 //! edge: its margin to that edge matches the mirror box's margin to the opposite edge, and the
 //! mirror's margin is labelled as the reference.
 
-use crate::spatial::{BoxEntry, SpatialIndex};
+use crate::spatial::BoxEntry;
 use crate::tools::Spacing;
 
 /// How far (pt) above or below the dragged box another box may sit and still count as a spacing
@@ -70,16 +70,21 @@ pub fn symmetric_margin_x(dragged: &BoxEntry, mirror: &BoxEntry, container: &Box
 }
 
 /// The boxes near `dragged` in 2-D: anywhere across the container's width, within
-/// [`PROXIMITY_Y`] above or below it. The R-tree does the narrowing, so neighbours do not have to
-/// share a row — a block a few points lower still takes part.
+/// [`PROXIMITY_Y`] above or below it. A block a few points lower still takes part (no row
+/// alignment required).
+///
+/// A linear sweep of `others` beats building an R-tree here: `nearby` runs on every mouse-move
+/// during a drag, and at slide scale the tree build costs more than just scanning the boxes.
 pub fn nearby(dragged: &BoxEntry, others: &[BoxEntry], container: &BoxEntry) -> Vec<BoxEntry> {
-    let mut ix = SpatialIndex::new();
-    for b in others.iter().filter(|b| b.id != dragged.id) {
-        ix.upsert(*b);
-    }
     let lo = container.min[0].min(dragged.min[0]);
     let hi = container.max[0].max(dragged.max[0]);
-    ix.within([lo, dragged.min[1] - PROXIMITY_Y], [hi, dragged.max[1] + PROXIMITY_Y])
+    let ylo = dragged.min[1] - PROXIMITY_Y;
+    let yhi = dragged.max[1] + PROXIMITY_Y;
+    others
+        .iter()
+        .filter(|b| b.id != dragged.id && b.max[0] >= lo && b.min[0] <= hi && b.max[1] >= ylo && b.min[1] <= yhi)
+        .copied()
+        .collect()
 }
 
 /// The spacing decision for a horizontal move: the snap offset and the measurements to label.
