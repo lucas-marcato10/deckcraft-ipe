@@ -326,6 +326,27 @@ pub enum ShapeKind {
     },
 }
 
+/// Auto Layout of a container (`Group`): gap between siblings plus margin to its edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AutoLayout {
+    /// Gap between adjacent sibling shapes (pt).
+    pub gap: f64,
+    /// Margin to the container's edges: [top, right, bottom, left] (pt).
+    pub padding: [f64; 4],
+    /// Flow direction of the siblings.
+    pub direction: LayoutDir,
+}
+
+/// The main axis a container's children flow along.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LayoutDir {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Shape {
@@ -361,6 +382,9 @@ pub struct Shape {
     /// On a SmartArt group: the diagram's text outline, from which its shapes are regenerated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagram: Option<Diagram>,
+    /// Auto Layout when the shape is a container (a `Group`). `None`: not Auto Layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<AutoLayout>,
 }
 
 /// A SmartArt diagram's data: its layout and its outline of nodes (the Text Pane).
@@ -436,6 +460,7 @@ impl Default for Shape {
             tags: vec![],
             raw_ext: None,
             diagram: None,
+            layout: None,
         }
     }
 }

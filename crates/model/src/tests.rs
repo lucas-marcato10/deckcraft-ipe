@@ -339,3 +339,13 @@ fn colour_alpha_follows_alpha_mod_and_off() {
     let both = base().with(ColorTransform::Alpha(40000)).with(ColorTransform::AlphaMod(50000));
     assert!((both.alpha() - 0.2).abs() < 1e-9, "{}", both.alpha());
 }
+
+#[test]
+fn autolayout_is_optional_and_serde_default() {
+    let s: crate::Shape = serde_json::from_str(r#"{"id":1,"name":"g"}"#).unwrap();
+    assert!(s.layout.is_none());
+    let mut s2 = crate::Shape::default();
+    s2.layout = Some(crate::AutoLayout { gap: 12.0, padding: [1.0, 2.0, 3.0, 4.0], direction: crate::LayoutDir::Vertical });
+    let back: crate::Shape = serde_json::from_str(&serde_json::to_string(&s2).unwrap()).unwrap();
+    assert_eq!(back.layout, s2.layout);
+}
