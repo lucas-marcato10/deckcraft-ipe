@@ -730,6 +730,9 @@ impl Session {
         let mut doc = (*st.doc).clone();
         let mut sel = st.selection.clone();
         let r = f(&mut doc, &mut sel)?;
+        // Auto Layout is the law: a container's children take their resolved positions before
+        // group refits look at the tree. Same transaction, so the gesture stays one undo step.
+        layout::reflow_doc(&st.doc, &mut doc);
         cmd::arrange::refit_groups(&st.doc, &mut doc);
         connect::reroute(&mut doc, &sel);
         st.doc = Arc::new(doc);

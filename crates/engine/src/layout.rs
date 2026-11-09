@@ -1,6 +1,6 @@
 //! Auto Layout engine: repositions children by gap/padding/direction (reflow).
 
-use deckcraft_model::{AutoLayout, LayoutDir, Shape, ShapeKind};
+use deckcraft_model::{AutoLayout, LayoutDir, Presentation, Shape, ShapeKind};
 
 /// One child for layout resolution: its own size plus its resolved position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,10 +68,13 @@ pub fn measure(node: &LayoutNode) -> (f64, f64) {
     match node {
         LayoutNode::Leaf { w, h } => (*w, *h),
         LayoutNode::Container { gap, pad, dir, children } => {
-            let mut boxes: Vec<ChildBox> = children.iter().map(|ch| {
-                let (w, h) = measure(ch);
-                ChildBox { w, h, x: 0.0, y: 0.0 }
-            }).collect();
+            let mut boxes: Vec<ChildBox> = children
+                .iter()
+                .map(|ch| {
+                    let (w, h) = measure(ch);
+                    ChildBox { w, h, x: 0.0, y: 0.0 }
+                })
+                .collect();
             reflow(&mut boxes, *gap, *pad, *dir, 0.0, 0.0)
         }
     }
@@ -83,10 +86,13 @@ pub fn reflow_tree(node: &LayoutNode, ox: f64, oy: f64) -> LayoutBox {
     match node {
         LayoutNode::Leaf { w, h } => LayoutBox { x: ox, y: oy, w: *w, h: *h, children: Vec::new() },
         LayoutNode::Container { gap, pad, dir, children } => {
-            let mut boxes: Vec<ChildBox> = children.iter().map(|ch| {
-                let (w, h) = measure(ch);
-                ChildBox { w, h, x: 0.0, y: 0.0 }
-            }).collect();
+            let mut boxes: Vec<ChildBox> = children
+                .iter()
+                .map(|ch| {
+                    let (w, h) = measure(ch);
+                    ChildBox { w, h, x: 0.0, y: 0.0 }
+                })
+                .collect();
             let (w, h) = reflow(&mut boxes, *gap, *pad, *dir, ox, oy);
             let placed = children.iter().zip(boxes.iter()).map(|(ch, b)| reflow_tree(ch, b.x, b.y)).collect();
             LayoutBox { x: ox, y: oy, w, h, children: placed }
@@ -116,12 +122,9 @@ fn auto_layout(sh: &Shape) -> Option<AutoLayout> {
 /// recursively; everything else is a leaf of its own box.
 pub fn to_layout_node(sh: &Shape) -> LayoutNode {
     match (auto_layout(sh), &sh.kind) {
-        (Some(l), ShapeKind::Group { children, .. }) => LayoutNode::Container {
-            gap: l.gap,
-            pad: l.padding,
-            dir: l.direction,
-            children: children.iter().map(to_layout_node).collect(),
-        },
+        (Some(l), ShapeKind::Group { children, .. }) => {
+            LayoutNode::Container { gap: l.gap, pad: l.padding, dir: l.direction, children: children.iter().map(to_layout_node).collect() }
+        }
         _ => {
             let x = sh.xfrm.unwrap_or_default();
             LayoutNode::Leaf { w: extent(x.w), h: extent(x.h) }
@@ -194,6 +197,39 @@ fn write_container(sh: &mut Shape, b: &LayoutBox, anchored: bool) {
     }
 }
 
+/// Reflow every Auto Layout container on the pages an edit touched. `old` is the presentation
+/// before the edit: a slide, master or layout whose `Arc` did not change is skipped, so an edit
+/// elsewhere costs no work. Called inside [`crate::Session::edit`], after the edit and before the
+/// group refit, so one gesture stays one undo step.
+pub(crate) fn reflow_doc(old: &Presentation, new: &mut Presentation) {
+    let old_slides: std::collections::HashMap<_, _> = old.slides.iter().map(|s| (s.id, s)).collect();
+    for slide in new.slides.iter_mut() {
+        let Some(before) = old_slides.get(&slide.id) else { continue };
+        if std::sync::Arc::ptr_eq(before, slide) {
+            continue;
+        }
+        apply_reflow(&mut std::sync::Arc::make_mut(slide).shapes);
+    }
+    for master in new.masters.iter_mut() {
+        let Some(before) = old.masters.iter().find(|m| m.id == master.id) else { continue };
+        if std::sync::Arc::ptr_eq(before, master) {
+            continue;
+        }
+        let master = std::sync::Arc::make_mut(master);
+        apply_reflow(&mut master.shapes);
+        for layout in master.layouts.iter_mut() {
+            apply_reflow(&mut layout.shapes);
+        }
+    }
+    for (before, after) in [(old.notes_master.as_ref(), new.notes_master.as_mut()), (old.handout_master.as_ref(), new.handout_master.as_mut())] {
+        let (Some(before), Some(after)) = (before, after) else { continue };
+        if std::sync::Arc::ptr_eq(before, after) {
+            continue;
+        }
+        apply_reflow(&mut std::sync::Arc::make_mut(after).shapes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,12 +262,8 @@ mod tests {
             dir: LayoutDir::Vertical,
             children: vec![LayoutNode::Leaf { w: 10.0, h: 10.0 }, LayoutNode::Leaf { w: 10.0, h: 10.0 }],
         };
-        let root = LayoutNode::Container {
-            gap: 0.0,
-            pad: [0.0; 4],
-            dir: LayoutDir::Horizontal,
-            children: vec![inner, LayoutNode::Leaf { w: 5.0, h: 5.0 }],
-        };
+        let root =
+            LayoutNode::Container { gap: 0.0, pad: [0.0; 4], dir: LayoutDir::Horizontal, children: vec![inner, LayoutNode::Leaf { w: 5.0, h: 5.0 }] };
         let (w, h) = measure(&root);
         assert!((w - 15.0).abs() < 1e-9, "w={w}");
         assert!((h - 20.0).abs() < 1e-9, "h={h}");

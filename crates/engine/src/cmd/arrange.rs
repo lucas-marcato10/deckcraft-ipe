@@ -294,9 +294,12 @@ fn refit_list(old: Option<&Vec<Shape>>, list: &mut [Shape], depth: usize) {
             )
         });
         let smart = sh.diagram.is_some();
+        // An Auto Layout container's box is its hugged content, set by the layout engine; the
+        // union of its children would drop the padding.
+        let auto = sh.layout.is_some();
         let ShapeKind::Group { children, child } = &mut sh.kind else { continue };
         refit_list(old_children, children, depth + 1);
-        if smart {
+        if smart || auto {
             // A SmartArt graphic's box is its own; its shapes are regenerated inside it.
             continue;
         }

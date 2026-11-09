@@ -989,12 +989,78 @@ fn reflow_nested_containers_place_inner_children() {
     let b_box = box_of(&mut s, b);
     assert!((b_box["y"].as_f64().unwrap() - (a_box["y"].as_f64().unwrap() + 20.0 + 5.0)).abs() < 1e-6, "{a_box} {b_box}");
     let c_box = box_of(&mut s, c);
-    assert!(
-        (c_box["x"].as_f64().unwrap() - (inner_box["x"].as_f64().unwrap() + 50.0 + 10.0)).abs() < 1e-6,
-        "{inner_box} {c_box}"
-    );
+    assert!((c_box["x"].as_f64().unwrap() - (inner_box["x"].as_f64().unwrap() + 50.0 + 10.0)).abs() < 1e-6, "{inner_box} {c_box}");
     let outer_box = box_of(&mut s, outer);
     assert!((outer_box["w"].as_f64().unwrap() - 100.0).abs() < 1e-6, "{outer_box}");
+}
+
+#[test]
+fn reflow_trigger_resize_keeps_gap_in_one_undo() {
+    use deckcraft_model::{AutoLayout, LayoutDir};
+    let mut s = session();
+    let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 80.0, 40.0]})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 200.0, 60.0, 30.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [a, b]})).unwrap();
+    let g = s.execute("arrange.group", &json!({})).unwrap()["id"].as_u64().unwrap();
+    // Setting the layout is itself an edit: it reflows at once.
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).ok_or_else(|| crate::EngineError::Other("no slide".into()))?;
+        let group = deckcraft_model::find_shape_mut(shapes, ShapeId(g as u32)).ok_or_else(|| crate::EngineError::Other("no group".into()))?;
+        group.layout = Some(AutoLayout { gap: 20.0, padding: [0.0; 4], direction: LayoutDir::Horizontal });
+        Ok(())
+    })
+    .unwrap();
+    let a0 = box_of(&mut s, a);
+    let b0 = box_of(&mut s, b);
+    assert!((b0["x"].as_f64().unwrap() - (a0["x"].as_f64().unwrap() + 80.0 + 20.0)).abs() < 1e-6, "{a0} {b0}");
+    // Resize the first child: the second slides along, keeping the gap.
+    s.execute("shape.resize", &json!({"id": a, "w": 100.0})).unwrap();
+    let a1 = box_of(&mut s, a);
+    let b1 = box_of(&mut s, b);
+    assert!((b1["x"].as_f64().unwrap() - (a1["x"].as_f64().unwrap() + 100.0 + 20.0)).abs() < 1e-6, "{a1} {b1}");
+    assert!((box_of(&mut s, g)["w"].as_f64().unwrap() - (100.0 + 20.0 + 60.0)).abs() < 1e-6);
+    // The resize and its reflow are one undo step.
+    s.execute("edit.undo", &json!({})).unwrap();
+    let a2 = box_of(&mut s, a);
+    let b2 = box_of(&mut s, b);
+    assert!((a2["w"].as_f64().unwrap() - 80.0).abs() < 1e-6, "{a2}");
+    assert!((b2["x"].as_f64().unwrap() - (a2["x"].as_f64().unwrap() + 80.0 + 20.0)).abs() < 1e-6, "{a2} {b2}");
+    // A moved child is an edit too: the flow puts it back in its slot.
+    s.execute("shape.move", &json!({"id": a, "dx": 50.0, "dy": 30.0})).unwrap();
+    let a3 = box_of(&mut s, a);
+    assert!((a3["x"].as_f64().unwrap() - a2["x"].as_f64().unwrap()).abs() < 1e-6, "{a2} {a3}");
+    assert!((a3["y"].as_f64().unwrap() - a2["y"].as_f64().unwrap()).abs() < 1e-6, "{a2} {a3}");
+}
+
+#[test]
+fn reflow_trigger_gap_change_moves_every_child() {
+    use deckcraft_model::{AutoLayout, LayoutDir};
+    let mut s = session();
+    let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 80.0, 40.0]})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 200.0, 60.0, 30.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [a, b]})).unwrap();
+    let g = s.execute("arrange.group", &json!({})).unwrap()["id"].as_u64().unwrap();
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).ok_or_else(|| crate::EngineError::Other("no slide".into()))?;
+        let group = deckcraft_model::find_shape_mut(shapes, ShapeId(g as u32)).ok_or_else(|| crate::EngineError::Other("no group".into()))?;
+        group.layout = Some(AutoLayout { gap: 20.0, padding: [0.0; 4], direction: LayoutDir::Horizontal });
+        Ok(())
+    })
+    .unwrap();
+    // Changing the container's gap reflows every child in the same edit.
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).ok_or_else(|| crate::EngineError::Other("no slide".into()))?;
+        let group = deckcraft_model::find_shape_mut(shapes, ShapeId(g as u32)).ok_or_else(|| crate::EngineError::Other("no group".into()))?;
+        if let Some(layout) = group.layout.as_mut() {
+            layout.gap = 60.0;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let a_box = box_of(&mut s, a);
+    let b_box = box_of(&mut s, b);
+    assert!((b_box["x"].as_f64().unwrap() - (a_box["x"].as_f64().unwrap() + 80.0 + 60.0)).abs() < 1e-6, "{a_box} {b_box}");
+    assert!((box_of(&mut s, g)["w"].as_f64().unwrap() - (80.0 + 60.0 + 60.0)).abs() < 1e-6);
 }
 
 #[test]
