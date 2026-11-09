@@ -68,3 +68,59 @@ fn turn_guides_on_drag_one_and_drop_it_off_the_slide() {
     assert!(!h.state().session.tool.guides_visible);
     assert_eq!(guides(&h).len(), 1);
 }
+
+/// The spacing label is points with one decimal, as the engine's model is in points.
+#[test]
+fn smart_guides_spacing_label_is_pt_with_one_decimal() {
+    assert_eq!(super::overlays::spacing_label(4.0), "4.0 pt");
+    assert_eq!(super::overlays::spacing_label(50.0), "50.0 pt");
+    assert_eq!(super::overlays::spacing_label(123.44), "123.4 pt");
+}
+
+/// Smart-guide spacing reaches the canvas: dragging a box that sits between two neighbours
+/// leaves BOTH equal gaps on the tool (R1) and the overlay draws their pt labels.
+#[test]
+fn smart_guides_draw_both_spacing_gaps() {
+    let _gpu = crate::gpu_lock::gpu_lock();
+    let mut s = Session::with_new();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [0.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 100.0, 100.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [153.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let app = SlideApp::new(s, Services::default());
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, app: &mut SlideApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(3);
+    let (slide, k) = (h.state().slide_rect.unwrap(), h.state().canvas_scale);
+    let at = |x: f32, y: f32| slide.min + egui::vec2(x * k, y * k);
+    // Drag M from [153..253] to [149..249]: the two gaps 49/51 equalize at 50/50 (x=150).
+    let (start, end) = (at(203.0, 140.0), at(199.0, 140.0));
+    h.hover_at(start);
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+    for i in 1..=8 {
+        h.event(egui::Event::PointerMoved(start + (end - start) * (i as f32 / 8.0)));
+        h.run_steps(1);
+    }
+    let gaps: Vec<(f64, f64, f64, bool)> = h.state().session.tool.spacing.iter().map(|s| (s.a, s.b, s.gap, s.reference)).collect();
+    assert_eq!(gaps.len(), 2, "R1 leaves both gaps on the tool: {gaps:?}");
+    assert!(gaps.iter().all(|&(_, _, gap, reference)| !reference && (gap - 50.0).abs() < 1e-6), "{gaps:?}");
+    assert!(gaps.iter().any(|&(a, b, ..)| (a - 100.0).abs() < 1e-6 && (b - 150.0).abs() < 1e-6), "{gaps:?}");
+    assert!(gaps.iter().any(|&(a, b, ..)| (a - 250.0).abs() < 1e-6 && (b - 300.0).abs() < 1e-6), "{gaps:?}");
+    // The overlay draws them (lines, end ticks, cards) without a panic; keep the frame for the eye.
+    if let Ok(img) = h.render() {
+        let _ = img.save("/tmp/smart-guides-spacing.png");
+    }
+    h.event(egui::Event::PointerButton { pos: end, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    assert!(h.state().session.tool.spacing.is_empty(), "released: the labels go away");
+}

@@ -2,6 +2,7 @@ use super::hit::table_rows;
 use super::{
     Drag, Guide, HistoryEntry, Point, Rect, Result, Session, Shape, ShapeId, ShapeKind, Spacing, ToolKind, Value, Vec2, Xfrm, cmd, json, xfrm_of,
 };
+use crate::spatial::BoxEntry;
 
 /// Above this many 1-D candidates (~1300 shapes × 3) an edge scan consults a ±4·tol window of
 /// the sorted vector instead of walking the whole list; below it the flat scan is cheaper.
@@ -230,62 +231,37 @@ impl Session {
         self.snap_edges(r, exclude, tol, enabled, SnapEdges { xs_on: [true; 3], ys_on: [true; 3], spacing: true })
     }
 
-    /// Equal-gap spacing on X: the moved box `r` keeps the gap between its immediate left
-    /// neighbour and that neighbour's own left neighbour (an A-B-C chain), or, sitting between
-    /// two neighbours, splits the difference so both gaps match. `None` unless a candidate lands
-    /// within `tol`. `at` is the row's centre, where the measuring line is drawn.
-    fn spacing_shift_x(&self, r: Rect, exclude: &[ShapeId], tol: f64) -> Option<(f64, Spacing)> {
+    /// Hierarchical spacing on X, with the candidate set narrowed by the rstar spatial index:
+    /// R1 labels the two gaps around a box sitting between two neighbours and snaps where they
+    /// match; R2 matches an outer box's margin to the mirror's margin on the opposite edge.
+    /// `None` when there is nothing to label. Called only after alignment lost the axis: within a
+    /// gesture, alignment > spacing > grid.
+    fn spacing_plan_x(&self, r: Rect, exclude: &[ShapeId], tol: f64) -> Option<(f64, Vec<Spacing>)> {
         let st = self.active()?;
-        let mut segs: Vec<(f64, f64)> = vec![]; // (x0, x1) of the boxes sharing the row
+        let mut boxes: Vec<BoxEntry> = vec![];
         for sh in st.shapes() {
             if exclude.contains(&sh.id) || sh.hidden {
                 continue;
             }
             let b = xfrm_of(&st.doc, &st.selection, sh).bounds();
+            if !(b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite()) {
+                continue;
+            }
             if b.width() < 1e-9 || b.height() < 1e-9 {
                 continue;
             }
-            // Only boxes that share the row: a gap measured against a box on another row would
-            // draw its line over empty slide.
-            if b.y1 < r.y0 - 1e-6 || b.y0 > r.y1 + 1e-6 {
-                continue;
-            }
-            segs.push((b.x0, b.x1));
+            boxes.push(BoxEntry::new(sh.id, b.x0, b.y0, b.x1, b.y1));
         }
-        let left = segs.iter().filter(|s| s.1 <= r.x0 + 1e-6).max_by(|a, b| a.1.total_cmp(&b.1)).copied();
-        let right = segs.iter().filter(|s| s.0 >= r.x1 - 1e-6).min_by(|a, b| a.0.total_cmp(&b.0)).copied();
-        let mut cands: Vec<(f64, f64)> = vec![]; // (dx, gap)
-        // A-B-C: continue the chain after a pair, keeping the pair's own gap.
-        if let Some(l) = left
-            && let Some(ll) = segs.iter().filter(|s| s.1 <= l.0 - 1e-6).max_by(|a, b| a.1.total_cmp(&b.1))
-        {
-            let gap = l.0 - ll.1;
-            if gap > 1e-9 {
-                cands.push((l.1 + gap - r.x0, gap));
-            }
-        }
-        // C-B-A: the same chain, mirrored (the box sits left of a pair).
-        if let Some(rr) = right
-            && let Some(rrr) = segs.iter().filter(|s| s.0 >= rr.1 + 1e-6).min_by(|a, b| a.0.total_cmp(&b.0))
-        {
-            let gap = rrr.0 - rr.1;
-            if gap > 1e-9 {
-                cands.push((rr.0 - gap - r.width() - r.x0, gap));
-            }
-        }
-        // Between two neighbours: equalize both gaps by moving half the difference.
-        if let (Some(l), Some(rr)) = (left, right) {
-            let (gap_l, gap_r) = (r.x0 - l.1, rr.0 - r.x1);
-            if gap_l >= -1e-9 && gap_r >= -1e-9 && (gap_l + gap_r) / 2.0 > 1e-9 {
-                cands.push(((gap_r - gap_l) / 2.0, (gap_l + gap_r) / 2.0));
-            }
-        }
-        let (dx, gap) = cands.into_iter().filter(|(dx, _)| dx.abs() <= tol).min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))?;
-        Some((dx, Spacing { vertical: true, a: r.x0 + dx - gap, b: r.x0 + dx, at: r.center().y, gap }))
+        let size = st.doc.slide_size;
+        let dragged = BoxEntry::new(ShapeId(0), r.x0, r.y0, r.x1, r.y1);
+        let container = BoxEntry::new(ShapeId(0), 0.0, 0.0, size.width, size.height);
+        let plan = crate::spacing::plan_x(&dragged, &boxes, &container, 0.0, tol);
+        (!plan.labels.is_empty()).then_some((plan.dx, plan.labels))
     }
 
-    /// `spacing_shift_x` on the other axis: `a`/`b`/`at` are y positions and the measuring line
-    /// runs across the column.
+    /// Legacy equal-gap spacing on Y (the smart-guide spacing concept is horizontal; this keeps
+    /// the vertical equidistance that shipped before it). `a`/`b`/`at` are y positions and the
+    /// measuring line runs across the column.
     fn spacing_shift_y(&self, r: Rect, exclude: &[ShapeId], tol: f64) -> Option<(f64, Spacing)> {
         let st = self.active()?;
         let mut segs: Vec<(f64, f64)> = vec![]; // (y0, y1) of the boxes sharing the column
@@ -328,7 +304,7 @@ impl Session {
             }
         }
         let (dy, gap) = cands.into_iter().filter(|(dy, _)| dy.abs() <= tol).min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))?;
-        Some((dy, Spacing { vertical: false, a: r.y0 + dy - gap, b: r.y0 + dy, at: r.center().x, gap }))
+        Some((dy, Spacing { vertical: false, a: r.y0 + dy - gap, b: r.y0 + dy, at: r.center().x, gap, reference: false }))
     }
 
     /// `snap_rect` looking only at some of `r`'s edges: `xs_on` is left, centre, right and `ys_on`
@@ -417,11 +393,11 @@ impl Session {
             for &(_, pos, _, _) in &wins_x {
                 guides.push(Guide { vertical: true, pos, from: 0.0, to: size.height });
             }
-        } else if spacing && let Some((dx, sp)) = self.spacing_shift_x(r, exclude, tol) {
-            // Equal gap, not an alignment: no full-span line, only the short measurement (the
-            // render draws it from `spacing`).
+        } else if spacing && let Some((dx, sps)) = self.spacing_plan_x(r, exclude, tol) {
+            // Equal gap or symmetric margin, not an alignment: no full-span line, only the short
+            // measurements (the render draws them from `spacing`).
             off.x = dx;
-            spacings.push(sp);
+            spacings.extend(sps);
         } else if self.prefs.snap_to_grid && xs_on.contains(&true) {
             let at = if xs_on[0] {
                 r.x0

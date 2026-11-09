@@ -164,16 +164,32 @@ pub(super) fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf:
             if g.vertical { (Point::new(g.pos, g.from), Point::new(g.pos, g.to)) } else { (Point::new(g.from, g.pos), Point::new(g.to, g.pos)) };
         painter.add(egui::Shape::dashed_line(&[xf.to_screen(a), xf.to_screen(b)], Stroke::new(1.0, t.guide), 5.0, 3.0));
     }
-    // Equal-gap spacing: a short line across the gap and its distance in points (the model is in
-    // points, so the label doesn't lie at another zoom).
+    // Equal-gap / symmetric-margin spacing: a short dimension line across the gap and its
+    // distance in points (the model is in points, so the label doesn't lie at another zoom).
     for sp in &app.session.tool.spacing {
         let (a, b) = if sp.vertical {
             (xf.to_screen(Point::new(sp.a, sp.at)), xf.to_screen(Point::new(sp.b, sp.at)))
         } else {
             (xf.to_screen(Point::new(sp.at, sp.a)), xf.to_screen(Point::new(sp.at, sp.b)))
         };
-        painter.line_segment([a, b], Stroke::new(1.0, t.guide));
-        let galley = painter.layout_no_wrap(format!("{:.1} pt", sp.gap), theme::font(11.0), t.text);
+        // The mirror's margin (R2 reference) is a dimmer dashed line: the dragged box's own
+        // measurement is what moves, the reference is what it is matching.
+        let color = if sp.reference { t.text_dim } else { t.guide };
+        let stroke = Stroke::new(1.0, color);
+        if sp.reference {
+            painter.add(egui::Shape::dashed_line(&[a, b], stroke, 4.0, 3.0));
+        } else {
+            painter.line_segment([a, b], stroke);
+        }
+        // End ticks, so the short line reads as a measured span and not as a stray guide.
+        for q in [a, b] {
+            if sp.vertical {
+                painter.line_segment([pos2(q.x, q.y - 3.0), pos2(q.x, q.y + 3.0)], stroke);
+            } else {
+                painter.line_segment([pos2(q.x - 3.0, q.y), pos2(q.x + 3.0, q.y)], stroke);
+            }
+        }
+        let galley = painter.layout_no_wrap(spacing_label(sp.gap), theme::font(11.0), if sp.reference { t.text_dim } else { t.text });
         let mid = pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
         // Above the line when it is horizontal, beside it when it is vertical, on a card so the
         // number stays readable over the slide's content.
@@ -183,7 +199,7 @@ pub(super) fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf:
             pos2(mid.x + 6.0, mid.y - galley.size().y / 2.0)
         };
         painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(2.0), CornerRadius::same(3), t.card);
-        painter.galley(at, galley, t.text);
+        painter.galley(at, galley, if sp.reference { t.text_dim } else { t.text });
     }
     if let Some(m) = app.session.tool.marquee {
         let r = Rect::from_two_pos(xf.to_screen(Point::new(m.x0, m.y0)), xf.to_screen(Point::new(m.x1, m.y1)));
@@ -251,6 +267,12 @@ pub(super) fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf:
             }
         }
     }
+}
+
+/// A spacing measurement's label: points with one decimal, e.g. `4.0 pt`. The engine works in
+/// points, so the label stays true at any zoom.
+pub(super) fn spacing_label(gap: f64) -> String {
+    format!("{:.1} pt", gap)
 }
 
 /// The text selection (quads) of the text being edited, in slide space: in a shape or a table

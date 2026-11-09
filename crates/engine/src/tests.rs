@@ -7372,6 +7372,92 @@ fn spacing_splits_the_difference_between_two_neighbours() {
     s.pointer(ev(PointerKind::Up, (253.0, 140.0))).unwrap();
 }
 
+/// R1 (bloco do meio): A=[0..100], M=[153..253], B=[300..400] — gaps 53 e 47. Arrastar M até
+/// [151..251] gruda em x=150, onde os DOIS gaps valem 50, e o tool.spacing carrega as duas
+/// medidas ao mesmo tempo: esq↔meio e meio↔dir.
+#[test]
+fn spacing_move_middle_shows_and_snaps_both_gaps_r1() {
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [0.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 100.0, 100.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [153.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, (x, y): (f64, f64)| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, (203.0, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (201.5, 140.0))).unwrap(); // 1.5 < tol: no-op, espelha o drag_gesture
+    s.pointer(ev(PointerKind::Drag, (199.0, 140.0))).unwrap(); // cru: M em [149..249], gaps 49/51
+    let b = box_of(&mut s, id);
+    assert_eq!(b["x"], 150.0, "os gaps 49/51 tinham que virar 50/50 e grudar M em 150: {b}");
+    let sp: Vec<_> = s.tool.spacing.iter().filter(|sp| sp.vertical).collect();
+    assert_eq!(sp.len(), 2, "R1 mostra os DOIS gaps ao mesmo tempo: {:?}", s.tool.spacing);
+    for l in &sp {
+        assert!((l.gap - 50.0).abs() < 1e-6, "os dois gaps valem 50: {l:?}");
+        assert!(!l.reference, "os dois gaps do R1 são medidas do move, não referência: {l:?}");
+    }
+    assert!(sp.iter().any(|l| (l.a - 100.0).abs() < 1e-6 && (l.b - 150.0).abs() < 1e-6), "gap esq↔meio = [100..150]: {:?}", s.tool.spacing);
+    assert!(sp.iter().any(|l| (l.a - 250.0).abs() < 1e-6 && (l.b - 300.0).abs() < 1e-6), "gap meio↔dir = [250..300]: {:?}", s.tool.spacing);
+    s.pointer(ev(PointerKind::Up, (201.0, 140.0))).unwrap();
+    assert!(s.tool.spacing.is_empty(), "Up limpa o spacing: {:?}", s.tool.spacing);
+}
+
+/// R2 (bloco externo): com o espelho à direita a 50 da borda (slide de 960), arrastar o bloco
+/// externo da esquerda gruda quando a margem dele até a borda esquerda também é 50; o spacing
+/// traz a margem do arrastado e a de REFERÊNCIA do espelho.
+#[test]
+fn spacing_move_outer_snaps_symmetric_margin_r2() {
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    // Espelho [860..910] em y=100: 50 pt até a borda direita (960).
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [860.0, 100.0, 50.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [46.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, (x, y): (f64, f64)| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, (96.0, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (97.5, 140.0))).unwrap(); // 1.5 < tol: no-op, espelha o drag_gesture
+    s.pointer(ev(PointerKind::Drag, (99.0, 140.0))).unwrap(); // cru: [49..149], margem esquerda 49
+    let b = box_of(&mut s, id);
+    assert_eq!(b["x"], 50.0, "a margem do arrastado tinha que igualar os 50 do espelho: {b}");
+    assert_eq!(s.tool.spacing.len(), 2, "R2 mostra a margem do arrastado + a referência do espelho: {:?}", s.tool.spacing);
+    let own = s.tool.spacing.iter().find(|l| !l.reference).expect("margem do arrastado");
+    assert!(own.vertical, "{own:?}");
+    assert!((own.a - 0.0).abs() < 1e-6 && (own.b - 50.0).abs() < 1e-6 && (own.gap - 50.0).abs() < 1e-6, "{own:?}");
+    let reference = s.tool.spacing.iter().find(|l| l.reference).expect("margem de referência do espelho");
+    assert!(reference.vertical, "{reference:?}");
+    assert!((reference.a - 910.0).abs() < 1e-6 && (reference.b - 960.0).abs() < 1e-6, "{reference:?}");
+    assert!((reference.gap - 50.0).abs() < 1e-6, "{reference:?}");
+    s.pointer(ev(PointerKind::Up, (99.0, 140.0))).unwrap();
+    assert!(s.tool.spacing.is_empty(), "Up limpa o spacing: {:?}", s.tool.spacing);
+}
+
+/// Prioridade: uma borda em x=148 (fora da faixa vertical do move, só o alinhamento 1-D a vê)
+/// vence o equal spacing do R1 — a caixa gruda na linha em 148, não em 150, e não há spacing.
+#[test]
+fn spacing_yields_to_alignment_on_the_same_axis() {
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = true;
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [0.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 100.0, 100.0, 80.0]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [148.0, 300.0, 40.0, 80.0]})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [153.0, 100.0, 100.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let ev = |kind, (x, y): (f64, f64)| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    s.pointer(ev(PointerKind::Down, (203.0, 140.0))).unwrap();
+    s.pointer(ev(PointerKind::Drag, (201.5, 140.0))).unwrap(); // 1.5 < tol: no-op
+    s.pointer(ev(PointerKind::Drag, (199.0, 140.0))).unwrap(); // cru: [149..249]; 149 a 1 pt de 148
+    let b = box_of(&mut s, id);
+    assert_eq!(b["x"], 148.0, "o alinhamento em 148 vence o equal spacing em 150: {b}");
+    assert!(s.tool.spacing.is_empty(), "com alinhamento no eixo não há spacing: {:?}", s.tool.spacing);
+    assert!(s.tool.guides.iter().any(|g| g.vertical && (g.pos - 148.0).abs() < 1e-6), "a guia de alinhamento em 148 aparece: {:?}", s.tool.guides);
+    s.pointer(ev(PointerKind::Up, (199.0, 140.0))).unwrap();
+}
+
 /// #3701 (regressão): o move gruda os bounds movidos, não o ponto do clique. Três press spots
 /// no mesmo shape, mesmo delta (+97) → as três rodadas terminam na MESMA posição grudada.
 /// No fork do Vectorcraft (970e62f) o snap usava o ponto pressionado (`snap(cx, start, d)`) e o

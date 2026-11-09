@@ -257,7 +257,9 @@ pub struct Guide {
 
 /// A gap measured between two neighbours for equidistance: `vertical` measures the distance along
 /// X (`a`/`b` are x positions), otherwise along Y. `at` is the cross-axis position the measuring
-/// line is drawn at, and `gap` the distance itself, in slide points.
+/// line is drawn at, and `gap` the distance itself, in slide points. `reference` marks the mirror
+/// block's margin in a symmetric-margin guide (R2): the distance the dragged block has to match,
+/// drawn dimmer than the dragged block's own measurement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Spacing {
     pub vertical: bool,
@@ -265,6 +267,7 @@ pub struct Spacing {
     pub b: f64,
     pub at: f64,
     pub gap: f64,
+    pub reference: bool,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -25,6 +25,7 @@ pub mod media_refs;
 pub mod recovery;
 pub mod sample;
 pub mod sounds;
+pub mod spacing;
 pub mod spatial;
 pub mod spell;
 pub mod templates;
