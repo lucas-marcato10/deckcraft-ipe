@@ -19,6 +19,7 @@ pub mod icons;
 pub mod inkshape;
 pub mod io;
 pub mod keys;
+pub mod layout;
 pub mod links;
 pub mod media_refs;
 pub mod recovery;
