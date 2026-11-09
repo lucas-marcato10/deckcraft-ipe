@@ -7,8 +7,12 @@
 
 use std::collections::HashMap;
 
-use deckcraft_model::ShapeId;
+use deckcraft_geom::{Affine, Rect, group_child_affine};
+use deckcraft_model::{Shape, ShapeId, ShapeKind};
 use rstar::{AABB, RTree, RTreeObject, SelectionFunction};
+
+use crate::DocState;
+use crate::cmd::xfrm_of;
 
 /// One index entry: a shape's AABB in slide space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -121,6 +125,46 @@ impl SelectionFunction<BoxEntry> for RegionSel {
     }
 }
 
+/// Flattens the edited shape tree (nested Groups included) into slide-space AABBs.
+///
+/// A group's children store their boxes in the group's child coordinate space; their index boxes
+/// must be where they are drawn, so the walk carries the accumulated affine down the tree exactly
+/// as the renderer does (`group_child_affine`). Non-finite boxes are skipped, like the renderer.
+pub fn collect_boxes(st: &DocState) -> Vec<BoxEntry> {
+    let mut out = Vec::new();
+    for sh in st.shapes() {
+        push_shape(st, sh, Affine::IDENTITY, &mut out);
+    }
+    out
+}
+
+fn push_shape(st: &DocState, sh: &Shape, parent: Affine, out: &mut Vec<BoxEntry>) {
+    let x = xfrm_of(&st.doc, &st.selection, sh);
+    if !x.is_finite() {
+        return;
+    }
+    let rect = (parent * x.affine()).transform_rect_bbox(Rect::new(0.0, 0.0, x.w, x.h));
+    if [rect.x0, rect.y0, rect.x1, rect.y1].iter().all(|v| v.is_finite()) {
+        out.push(BoxEntry::new(sh.id, rect.x0, rect.y0, rect.x1, rect.y1));
+    }
+    if let ShapeKind::Group { children, child } = &sh.kind {
+        let ch = Rect::new(child.x, child.y, child.x + child.w, child.y + child.h);
+        let child_to_slide = parent * group_child_affine(&x, ch);
+        for c in children {
+            push_shape(st, c, child_to_slide, out);
+        }
+    }
+}
+
+/// Builds a fresh index over every shape on the edited page, groups flattened.
+pub fn build_index(st: &DocState) -> SpatialIndex {
+    let mut ix = SpatialIndex::new();
+    for b in collect_boxes(st) {
+        ix.upsert(b);
+    }
+    ix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +216,32 @@ mod tests {
         assert_eq!(c[0].id, ShapeId(1));
         // Corner order does not matter.
         assert_eq!(ix.cull([20.0, 20.0], [0.0, 0.0]).len(), 1);
+    }
+
+    #[test]
+    fn build_index_collects_nested_group_boxes() {
+        use serde_json::json;
+
+        let mut s = crate::tests::session();
+        s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+        let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [0, 0, 50, 50]})).unwrap()["id"].as_u64().unwrap();
+        let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100, 0, 50, 50]})).unwrap()["id"].as_u64().unwrap();
+        let g = s.execute("arrange.group", &json!({"ids": [a, b]})).unwrap()["id"].as_u64().unwrap();
+
+        let before = { collect_boxes(s.doc().unwrap()) };
+        assert_eq!(before.len(), 3, "group + 2 children: {before:?}");
+        let ix = build_index(s.doc().unwrap());
+        assert_eq!(ix.len(), 3);
+
+        // Children are indexed in slide space, not in the group's child space: moving the group
+        // must move their boxes with it (their own xfrm does not change).
+        s.execute("shape.move", &json!({"dx": 100.0, "dy": 20.0})).unwrap();
+        let after = { collect_boxes(s.doc().unwrap()) };
+        let box_of = |v: &[BoxEntry], id: u64| *v.iter().find(|e| e.id.0 as u64 == id).unwrap();
+        for id in [a, b, g] {
+            let (p, q) = (box_of(&before, id), box_of(&after, id));
+            assert!((q.min[0] - p.min[0] - 100.0).abs() < 1e-9, "box {id} x moved: {p:?} -> {q:?}");
+            assert!((q.min[1] - p.min[1] - 20.0).abs() < 1e-9, "box {id} y moved: {p:?} -> {q:?}");
+        }
     }
 }

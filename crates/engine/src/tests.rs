@@ -6,7 +6,7 @@ use crate::{
 };
 use deckcraft_model::ShapeId;
 
-fn session() -> Session {
+pub(crate) fn session() -> Session {
     Session::with_new()
 }
 
