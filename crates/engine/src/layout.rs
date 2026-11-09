@@ -1,6 +1,6 @@
 //! Auto Layout engine: repositions children by gap/padding/direction (reflow).
 
-use deckcraft_model::LayoutDir;
+use deckcraft_model::{AutoLayout, LayoutDir, Shape, ShapeKind};
 
 /// One child for layout resolution: its own size plus its resolved position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,6 +90,106 @@ pub fn reflow_tree(node: &LayoutNode, ox: f64, oy: f64) -> LayoutBox {
             let (w, h) = reflow(&mut boxes, *gap, *pad, *dir, ox, oy);
             let placed = children.iter().zip(boxes.iter()).map(|(ch, b)| reflow_tree(ch, b.x, b.y)).collect();
             LayoutBox { x: ox, y: oy, w, h, children: placed }
+        }
+    }
+}
+
+/// A distance used by the layout: finite and never negative.
+fn extent(v: f64) -> f64 {
+    if v.is_finite() { v.abs() } else { 0.0 }
+}
+
+/// The Auto Layout of a shape, when it is a group (only a group has children to flow).
+fn auto_layout(sh: &Shape) -> Option<AutoLayout> {
+    let l = sh.layout?;
+    if !sh.is_group() {
+        return None;
+    }
+    Some(AutoLayout {
+        gap: if l.gap.is_finite() { l.gap.max(0.0) } else { 0.0 },
+        padding: l.padding.map(|p| if p.is_finite() { p.max(0.0) } else { 0.0 }),
+        direction: l.direction,
+    })
+}
+
+/// A shape as a layout node: an Auto Layout group is a container whose children convert
+/// recursively; everything else is a leaf of its own box.
+pub fn to_layout_node(sh: &Shape) -> LayoutNode {
+    match (auto_layout(sh), &sh.kind) {
+        (Some(l), ShapeKind::Group { children, .. }) => LayoutNode::Container {
+            gap: l.gap,
+            pad: l.padding,
+            dir: l.direction,
+            children: children.iter().map(to_layout_node).collect(),
+        },
+        _ => {
+            let x = sh.xfrm.unwrap_or_default();
+            LayoutNode::Leaf { w: extent(x.w), h: extent(x.h) }
+        }
+    }
+}
+
+/// Reflow every Auto Layout container in a shape list: a container hugs its children and places
+/// them by gap/padding/direction, nested containers included. Leaves keep their size; only
+/// positions are written into them.
+pub fn apply_reflow(shapes: &mut [Shape]) {
+    for sh in shapes.iter_mut() {
+        reflow_shape(sh);
+    }
+}
+
+fn reflow_shape(sh: &mut Shape) {
+    if auto_layout(sh).is_some() {
+        // A container's children live in its child space; the hug box starts at that space's
+        // origin, so a group moved on the slide keeps its children where they are shown.
+        let (ox, oy) = match &sh.kind {
+            ShapeKind::Group { child, .. } => (child.x, child.y),
+            _ => (0.0, 0.0),
+        };
+        let placed = reflow_tree(&to_layout_node(sh), ox, oy);
+        write_container(sh, &placed, false);
+        return;
+    }
+    if let Some(children) = sh.children_mut() {
+        for ch in children.iter_mut() {
+            reflow_shape(ch);
+        }
+    }
+}
+
+/// Write a resolved container box into `sh` and its children. `anchored`: the box came from a
+/// parent's flow, so the shape and its child coordinate space move to it; the outermost container
+/// keeps its own placement and only takes the hugged size.
+fn write_container(sh: &mut Shape, b: &LayoutBox, anchored: bool) {
+    if let Some(x) = sh.xfrm.as_mut() {
+        if anchored {
+            x.x = b.x;
+            x.y = b.y;
+        }
+        x.w = b.w;
+        x.h = b.h;
+    }
+    let ShapeKind::Group { children, child } = &mut sh.kind else { return };
+    if anchored {
+        child.x = b.x;
+        child.y = b.y;
+    }
+    child.w = b.w;
+    child.h = b.h;
+    for (ch, cb) in children.iter_mut().zip(b.children.iter()) {
+        if auto_layout(ch).is_some() {
+            write_container(ch, cb, true);
+        } else {
+            if let Some(x) = ch.xfrm.as_mut() {
+                x.x = cb.x;
+                x.y = cb.y;
+            }
+            // A plain group in a container keeps its own box; reflow whatever Auto Layout it holds.
+            if let Some(kids) = ch.children_mut() {
+                for k in kids.iter_mut() {
+                    reflow_shape(k);
+                }
+            }
         }
     }
 }

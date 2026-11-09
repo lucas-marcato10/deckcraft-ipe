@@ -916,6 +916,88 @@ fn groups_nest_only_as_deep_as_a_saved_file_reopens() {
 }
 
 #[test]
+fn reflow_writes_positions_into_shape_xfrm() {
+    use deckcraft_model::{AutoLayout, LayoutDir};
+    let mut s = session();
+    let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 80.0, 40.0]})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [300.0, 200.0, 60.0, 30.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [a, b]})).unwrap();
+    let g = s.execute("arrange.group", &json!({})).unwrap()["id"].as_u64().unwrap();
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).ok_or_else(|| crate::EngineError::Other("no slide".into()))?;
+        let group = deckcraft_model::find_shape_mut(shapes, ShapeId(g as u32)).ok_or_else(|| crate::EngineError::Other("no group".into()))?;
+        group.layout = Some(AutoLayout { gap: 20.0, padding: [0.0; 4], direction: LayoutDir::Horizontal });
+        Ok(())
+    })
+    .unwrap();
+    // Resolve the container from the shape tree and write the boxes back into the children.
+    let slide = s.doc().unwrap().selection.slide;
+    {
+        let st = s.doc_mut().unwrap();
+        let doc = std::sync::Arc::make_mut(&mut st.doc);
+        let slide = std::sync::Arc::make_mut(&mut doc.slides[slide]);
+        crate::layout::apply_reflow(&mut slide.shapes);
+    }
+    let a_box = box_of(&mut s, a);
+    let b_box = box_of(&mut s, b);
+    let g_box = box_of(&mut s, g);
+    let (ax, aw) = (a_box["x"].as_f64().unwrap(), a_box["w"].as_f64().unwrap());
+    let bx = b_box["x"].as_f64().unwrap();
+    assert!((bx - (ax + aw + 20.0)).abs() < 1e-6, "b at {bx}, a at {ax} w {aw}");
+    // The container hugs its children: 80 + gap 20 + 60 wide, the tallest child high.
+    assert!((g_box["w"].as_f64().unwrap() - 160.0).abs() < 1e-6, "{g_box}");
+    assert!((g_box["h"].as_f64().unwrap() - 40.0).abs() < 1e-6, "{g_box}");
+    assert!((b_box["y"].as_f64().unwrap() - g_box["y"].as_f64().unwrap()).abs() < 1e-6, "{b_box}");
+}
+
+#[test]
+fn reflow_nested_containers_place_inner_children() {
+    use deckcraft_model::{AutoLayout, LayoutDir};
+    let mut s = session();
+    let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [10.0, 10.0, 50.0, 20.0]})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [10.0, 50.0, 50.0, 20.0]})).unwrap()["id"].as_u64().unwrap();
+    let c = s.execute("shape.insert", &json!({"preset": "rect", "rect": [200.0, 10.0, 40.0, 40.0]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [a, b]})).unwrap();
+    let inner = s.execute("arrange.group", &json!({})).unwrap()["id"].as_u64().unwrap();
+    s.execute("edit.select", &json!({"ids": [inner, c]})).unwrap();
+    let outer = s.execute("arrange.group", &json!({})).unwrap()["id"].as_u64().unwrap();
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).ok_or_else(|| crate::EngineError::Other("no slide".into()))?;
+        let set = |shapes: &mut Vec<deckcraft_model::Shape>, id: u64, layout: AutoLayout| {
+            if let Some(sh) = deckcraft_model::find_shape_mut(shapes, ShapeId(id as u32)) {
+                sh.layout = Some(layout);
+            }
+        };
+        set(shapes, inner, AutoLayout { gap: 5.0, padding: [0.0; 4], direction: LayoutDir::Vertical });
+        set(shapes, outer, AutoLayout { gap: 10.0, padding: [0.0; 4], direction: LayoutDir::Horizontal });
+        Ok(())
+    })
+    .unwrap();
+    let slide = s.doc().unwrap().selection.slide;
+    {
+        let st = s.doc_mut().unwrap();
+        let doc = std::sync::Arc::make_mut(&mut st.doc);
+        let slide = std::sync::Arc::make_mut(&mut doc.slides[slide]);
+        crate::layout::apply_reflow(&mut slide.shapes);
+    }
+    // Inner hugs its two 20-high leaves with a 5 gap: 50×45. Outer flows it beside the 40×40
+    // rect with a 10 gap: 100×45, so the last child starts at the inner's right edge + 10.
+    let inner_box = box_of(&mut s, inner);
+    assert!((inner_box["w"].as_f64().unwrap() - 50.0).abs() < 1e-6, "{inner_box}");
+    assert!((inner_box["h"].as_f64().unwrap() - 45.0).abs() < 1e-6, "{inner_box}");
+    let a_box = box_of(&mut s, a);
+    let b_box = box_of(&mut s, b);
+    assert!((b_box["y"].as_f64().unwrap() - (a_box["y"].as_f64().unwrap() + 20.0 + 5.0)).abs() < 1e-6, "{a_box} {b_box}");
+    let c_box = box_of(&mut s, c);
+    assert!(
+        (c_box["x"].as_f64().unwrap() - (inner_box["x"].as_f64().unwrap() + 50.0 + 10.0)).abs() < 1e-6,
+        "{inner_box} {c_box}"
+    );
+    let outer_box = box_of(&mut s, outer);
+    assert!((outer_box["w"].as_f64().unwrap() - 100.0).abs() < 1e-6, "{outer_box}");
+}
+
+#[test]
 fn align_and_distribute() {
     let mut s = session();
     let mut ids = vec![];
