@@ -51,6 +51,7 @@ pub use control::{ControlRequest, ControlResponse};
 mod app;
 mod clock;
 mod ime_hooks;
+mod inp;
 pub mod panels;
 mod repaint;
 mod services;
@@ -252,6 +253,10 @@ pub struct SlideApp {
     last_frame_ms: Option<f64>,
     /// Painted frames so far: the `frame.id` span attribute that ties a trace to a log line.
     frame_id: u64,
+    /// Interactions (control channel or real input) waiting for the frame that paints them, and
+    /// their monotonic key counter. See [`inp`].
+    interactions: Vec<inp::PendingInteraction>,
+    interaction_seq: u64,
     /// Synthetic input events (control channel `ui.click` etc.), injected one per frame.
     pub(crate) synthetic: Vec<egui::Event>,
     /// A synthetic batch has been injected but the UI pass has not acknowledged it. While this

@@ -70,6 +70,8 @@ impl SlideApp {
             perf: Perf { frame_ms: 0.0, render_ms: 0.0, fps: 0.0 },
             last_frame_ms: None,
             frame_id: 0,
+            interactions: Vec::new(),
+            interaction_seq: 0,
             synthetic: vec![],
             synthetic_pending: false,
             synthetic_next: vec![],
@@ -315,6 +317,10 @@ impl SlideApp {
     /// Everything one painted frame does, inside its `deckcraft.frame` span.
     fn frame_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // An interaction queued by real input reached this pass: its handling starts here (and, in
+        // an immediate-mode UI, its frame is requested in the same tick). Control-channel
+        // interactions were dispatched when their request ran and keep those timestamps.
+        self.interaction_frame_started(now_ms());
         let t = theme::Tokens::get(&ctx);
         let build_start = now_ms();
         let shown = deckcraft_telemetry::spans::phase_span(sc::P_BUILD, || self.frame_build(ui));
@@ -426,6 +432,10 @@ impl SlideApp {
             // the coarse class that is certainly true.
             instruments.frame_janky.add(1, &[KeyValue::new(sc::A_JANK_CLASS, sc::V_JANK_MISSED_VSYNC)]);
         }
+        // This frame painted whatever input it consumed, so it is the frame that closes those
+        // interactions. Do it after the frame's own instruments: the INP total ends at frame close
+        // (the backend reports no presentation callback), and the frame's cost is not part of it.
+        self.interaction_painted(now_ms());
     }
 
     pub fn open_url(&mut self, url: &str) {

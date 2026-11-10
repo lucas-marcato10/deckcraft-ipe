@@ -18,6 +18,8 @@
 use std::sync::mpsc::Sender;
 
 use deckcraft_engine::{Mods, PointerEvent};
+use deckcraft_telemetry::sc;
+use opentelemetry::KeyValue;
 use serde_json::{Value, json};
 
 use crate::SlideApp;
@@ -149,6 +151,17 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
         "ui.pointer" => {
             let Some(events) = p.get("events").and_then(Value::as_array) else { return err("missing `events`") };
             let base = p.get("mods").map(mods_from).unwrap_or_default();
+            // The gesture is timed on egui's clock — the same one the frame that closes it reads —
+            // so the three INP phases share one monotonic base. The request is handled here in
+            // `logic`, before the UI pass: the wait until that pass is real `presentation` time.
+            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let interaction = app.interaction_begin(sc::V_INTERACTION_DRAG, t_input);
+            app.interaction_dispatched(&interaction, t_input);
+            // Every event after the first is collapsed into the same paint. Non-zero means this
+            // request cannot price per-frame pointer cost (the collapsed-gesture trap).
+            deckcraft_telemetry::instruments()
+                .interaction_coalesced
+                .add(events.len().saturating_sub(1) as u64, &[KeyValue::new(sc::A_INTERACTION_TYPE, sc::V_INTERACTION_DRAG)]);
             let mut last = Value::Null;
             for e in events {
                 let kind = e.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -163,27 +176,40 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                     Err(e) => return err(e),
                 }
             }
+            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
             ok(json!({"result": last, "selection": app.session.active().map(|d| serde_json::to_value(&d.selection).unwrap_or_default())}))
         }
         "ui.key" => {
             let Some(k) = s("key") else { return err("missing `key`") };
-            if app.anim_preview_active() && app.show.is_none() && matches!(k.to_ascii_lowercase().as_str(), "escape" | "esc") {
-                app.stop_anim_preview();
-                return ok(json!({"preview": false}));
-            }
-            if let Some(show) = app.show.as_ref()
-                && !show.ended
-                && let Some(key) = key_from(k)
-            {
-                app.queue_input(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
-                app.queue_input(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
-                return ok(json!({"show": true}));
-            }
-            wrap(app.session.key(k, mods_from(p)).map_err(|e| e.to_string()))
+            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let interaction = app.interaction_begin(sc::V_INTERACTION_KEY, t_input);
+            app.interaction_dispatched(&interaction, t_input);
+            let outcome = (|| {
+                if app.anim_preview_active() && app.show.is_none() && matches!(k.to_ascii_lowercase().as_str(), "escape" | "esc") {
+                    app.stop_anim_preview();
+                    return ok(json!({"preview": false}));
+                }
+                if let Some(show) = app.show.as_ref()
+                    && !show.ended
+                    && let Some(key) = key_from(k)
+                {
+                    app.queue_input(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+                    app.queue_input(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+                    return ok(json!({"show": true}));
+                }
+                wrap(app.session.key(k, mods_from(p)).map_err(|e| e.to_string()))
+            })();
+            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
+            outcome
         }
         "ui.text" => {
             let Some(t) = s("text") else { return err("missing `text`") };
-            wrap(app.session.type_text(t).map_err(|e| e.to_string()))
+            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let interaction = app.interaction_begin(sc::V_INTERACTION_TEXT, t_input);
+            app.interaction_dispatched(&interaction, t_input);
+            let outcome = wrap(app.session.type_text(t).map_err(|e| e.to_string()));
+            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
+            outcome
         }
         "ui.ime" => {
             // An input method's event, through egui like a real one: it reaches the slide's text
@@ -199,7 +225,11 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
             } else {
                 return err("missing `preedit` or `commit`");
             };
+            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let interaction = app.interaction_begin(sc::V_INTERACTION_IME, t_input);
+            app.interaction_dispatched(&interaction, t_input);
             app.queue_input(egui::Event::Ime(ev));
+            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
             ok(json!({"queued": true}))
         }
         "ui.tool.select" => {
@@ -215,21 +245,24 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
         "ui.move" | "ui.click" | "ui.drag" => {
             let (Some(x), Some(y)) = (f(p, "x"), f(p, "y")) else { return err("missing x/y") };
             let pos = egui::pos2(x, y);
-            app.queue_input(egui::Event::PointerMoved(pos));
-            if req.method == "ui.click" {
+            // Build the batch first, so a malformed drag fails before anything is queued and
+            // before an interaction is opened for a request that never runs.
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            let kind = if req.method == "ui.click" {
                 let button = match s("button") {
                     Some("right" | "secondary") => egui::PointerButton::Secondary,
                     _ => egui::PointerButton::Primary,
                 };
                 let count = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 3);
                 for _ in 0..count {
-                    app.queue_input(egui::Event::PointerButton { pos, button, pressed: true, modifiers: egui::Modifiers::NONE });
-                    app.queue_input(egui::Event::PointerButton { pos, button, pressed: false, modifiers: egui::Modifiers::NONE });
+                    events.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: egui::Modifiers::NONE });
+                    events.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: egui::Modifiers::NONE });
                 }
+                Some(sc::V_INTERACTION_CLICK)
             } else if req.method == "ui.drag" {
                 let (Some(tx), Some(ty)) = (f(p, "toX"), f(p, "toY")) else { return err("missing toX/toY") };
                 let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(8).clamp(1, 120);
-                app.queue_input(egui::Event::PointerButton {
+                events.push(egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed: true,
@@ -237,18 +270,40 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 });
                 for k in 1..=steps {
                     let a = k as f32 / steps as f32;
-                    app.queue_input(egui::Event::PointerMoved(egui::pos2(x + (tx - x) * a, y + (ty - y) * a)));
+                    events.push(egui::Event::PointerMoved(egui::pos2(x + (tx - x) * a, y + (ty - y) * a)));
                 }
-                app.queue_input(egui::Event::PointerButton {
+                events.push(egui::Event::PointerButton {
                     pos: egui::pos2(tx, ty),
                     button: egui::PointerButton::Primary,
                     pressed: false,
                     modifiers: egui::Modifiers::NONE,
                 });
+                Some(sc::V_INTERACTION_DRAG)
+            } else {
+                // A hover is pointer position, not an interaction: INP measures presses and keys,
+                // so `ui.move` queues events without opening a sample.
+                None
+            };
+            let interaction = kind.map(|kind| {
+                let t_input = ctx.input(|i| i.time) * 1000.0;
+                let key = app.interaction_begin(kind, t_input);
+                app.interaction_dispatched(&key, t_input);
+                // The queued events are painted by one frame: the same collapse `ui.pointer`
+                // reports, and the same reason a "drag was free" reading may be a false negative.
+                deckcraft_telemetry::instruments()
+                    .interaction_coalesced
+                    .add(events.len().saturating_sub(1) as u64, &[KeyValue::new(sc::A_INTERACTION_TYPE, kind)]);
+                key
+            });
+            for event in events {
+                app.queue_input(event);
             }
             // The control server already counted the wake that brought this request (it is the one
             // place the channel wakes the UI); this call only makes the scheduled frame happen.
             ctx.request_repaint();
+            if let Some(key) = interaction {
+                app.interaction_processed(&key, ctx.input(|i| i.time) * 1000.0);
+            }
             ok(json!({"queued": app.synthetic_queued_len()}))
         }
         "ui.set" => {

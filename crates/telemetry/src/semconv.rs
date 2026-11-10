@@ -336,6 +336,16 @@ pub const V_REPAINT_CONTROL: &str = "control";
 pub const V_REPAINT_CONTINUOUS: &str = "continuous";
 /// `repaint.source`: a synthetic benchmark driver.
 pub const V_REPAINT_SYNTHETIC: &str = "synthetic";
+/// `interaction.type`: the pointer pressed and moved before releasing.
+pub const V_INTERACTION_DRAG: &str = "drag";
+/// `interaction.type`: a pointer press and release without a move in between.
+pub const V_INTERACTION_CLICK: &str = "click";
+/// `interaction.type`: a key press reached the app.
+pub const V_INTERACTION_KEY: &str = "key";
+/// `interaction.type`: a text input event (a control-channel `ui.text`).
+pub const V_INTERACTION_TEXT: &str = "text";
+/// `interaction.type`: an input-method event.
+pub const V_INTERACTION_IME: &str = "ime";
 /// `task.name`: PDF export.
 pub const V_TASK_EXPORT_PDF: &str = "export.pdf";
 /// `task.name`: a raster pass.

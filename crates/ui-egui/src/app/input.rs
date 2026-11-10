@@ -1,6 +1,49 @@
 use super::{InputTarget, SlideApp, show};
+use deckcraft_telemetry::sc;
 
 impl SlideApp {
+    /// Instrument the host's own input for INP: one `deckcraft.interaction` per gesture this
+    /// `RawInput` carries, timed with `raw.time` (egui's clock, the same one the frame that closes
+    /// it reads).
+    ///
+    /// A press begins the gesture; a move *after* the press makes it a drag, so a hover followed by
+    /// a click is a click. Hovering alone is pointer position, not an interaction, which is why a
+    /// bare `PointerMoved` opens nothing. Keys get their own interaction: in a pass that carries
+    /// both a click and a key, the two latencies are not the same measurement.
+    ///
+    /// This is what makes INP work outside the control channel; the channel's `ui.pointer` is the
+    /// synthetic route and reports its coalesced events separately.
+    pub(super) fn observe_raw_input(&mut self, raw: &egui::RawInput) {
+        let Some(time) = raw.time else {
+            // No host timestamp: guessing one would put a fabricated number in the histogram.
+            return;
+        };
+        let at_ms = time * 1000.0;
+        let mut pressed = false;
+        let mut moved_after_press = false;
+        let mut key_pressed = false;
+        for event in &raw.events {
+            match event {
+                egui::Event::PointerButton { pressed: true, .. } => pressed = true,
+                egui::Event::PointerMoved(_) if pressed => moved_after_press = true,
+                egui::Event::Key { pressed: true, .. } => key_pressed = true,
+                _ => {}
+            }
+        }
+        if pressed {
+            let kind = if moved_after_press { sc::V_INTERACTION_DRAG } else { sc::V_INTERACTION_CLICK };
+            let interaction = self.interaction_begin(kind, at_ms);
+            // The hook runs immediately before the pass that consumes the event, so the handler
+            // starts now: the OS-to-winit queue delay is not observable from here and is not
+            // invented.
+            self.interaction_dispatched(&interaction, at_ms);
+        }
+        if key_pressed {
+            let interaction = self.interaction_begin(sc::V_INTERACTION_KEY, at_ms);
+            self.interaction_dispatched(&interaction, at_ms);
+        }
+    }
+
     /// What a queued synthetic event is meant for. The control protocol hands out window
     /// coordinates, so a document, slide, view, zoom or canvas-layout change between queueing and
     /// the next UI pass makes the event stale.
@@ -202,6 +245,7 @@ impl SlideApp {
     /// delivered exactly once in the next real UI pass. `ViewportInfo::visible()` is not a phase
     /// signal: a hidden root still gets a full pass for a screenshot or `RequestPaintWhileHidden`.
     pub fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.observe_raw_input(raw);
         #[cfg(not(target_arch = "wasm32"))]
         for f in std::mem::take(&mut raw.dropped_files) {
             let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped file".into());

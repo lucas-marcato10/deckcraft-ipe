@@ -222,6 +222,58 @@ fn painted_frames_emit_their_duration_delta_and_phases() {
     );
 }
 
+/// A pointer gesture driven through the control channel must produce one INP sample with all three
+/// phases. This is the route where the collapsed-gesture trap lives: `ui.pointer` hands the engine
+/// three events in one request, the app handles them in one `logic` pass and one frame paints the
+/// result — so the sample must be closed by the frame that painted it, not by a later frame.
+#[test]
+fn a_pointer_gesture_through_the_control_channel_reports_inp_and_its_three_phases() {
+    let _reading = reader();
+    let mut harness = harness();
+    harness.run_steps(3);
+
+    let before = points();
+    let duration_before = total(&before, |point| point.metric == sc::M_INTERACTION_DURATION);
+    let phase_before = total(&before, |point| point.metric == sc::M_INTERACTION_PHASE);
+    let coalesced_before = total(&before, |point| point.metric == sc::M_INTERACTION_COALESCED);
+
+    let (request, _reply) = crate::control::ControlRequest::new(
+        "ui.pointer",
+        json!({"events": [
+            {"kind": "down", "x": 480.0, "y": 200.0},
+            {"kind": "drag", "x": 520.0, "y": 220.0},
+            {"kind": "up", "x": 520.0, "y": 220.0},
+        ]}),
+    );
+    let ctx = harness.ctx.clone();
+    let outcome = crate::control::handle(harness.state_mut(), &ctx, &request);
+    assert!(matches!(outcome, crate::control::Outcome::Done(_)), "the control request must be accepted");
+    harness.run_steps(2);
+
+    let after = points();
+    assert!(
+        total(&after, |point| point.metric == sc::M_INTERACTION_DURATION && point.attr(sc::A_INTERACTION_TYPE) == Some("drag")) > duration_before,
+        "no {} sample for the gesture: {:?}",
+        sc::M_INTERACTION_DURATION,
+        names(&after)
+    );
+    for phase in [sc::P_INPUT_DELAY, sc::P_PROCESSING, sc::P_PRESENTATION] {
+        assert!(
+            total(&after, |point| point.metric == sc::M_INTERACTION_PHASE && point.attr(sc::A_INP_PHASE) == Some(phase)) > phase_before,
+            "no {} sample for inp.phase={phase}: {:?}",
+            sc::M_INTERACTION_PHASE,
+            names(&after)
+        );
+    }
+    // The gate: three engine events became one paint, so two events were coalesced. A run whose
+    // coalesced count is above zero cannot be used to price per-frame pointer cost.
+    assert!(
+        total(&after, |point| point.metric == sc::M_INTERACTION_COALESCED) - coalesced_before >= 2.0,
+        "three events painted by one frame must report two coalesced events: {:?}",
+        names(&after)
+    );
+}
+
 /// An unchanged slide must hit the texture cache, an edited one must miss *with a reason*, and
 /// every phase of the miss (raster, convert, upload) must be timed. A 24 ms miss that reports
 /// only its raster is the blind instrument this instrumentation exists to replace.
