@@ -20,6 +20,7 @@ use deckcraft_telemetry::sc;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+use serde_json::json;
 
 use crate::{Services, SlideApp};
 
@@ -219,4 +220,40 @@ fn painted_frames_emit_their_duration_delta_and_phases() {
         sc::M_FRAME_DELTA,
         names(&points)
     );
+}
+
+/// An unchanged slide must hit the texture cache, an edited one must miss *with a reason*, and
+/// every phase of the miss (raster, convert, upload) must be timed. A 24 ms miss that reports
+/// only its raster is the blind instrument this instrumentation exists to replace.
+#[test]
+fn an_edited_slide_misses_the_texture_cache_with_a_reason_and_times_every_phase() {
+    let _reading = reader();
+    let mut harness = harness();
+    harness.run_steps(3);
+
+    let before = points();
+    let reasoned_before = total(&before, |point| point.metric == sc::M_CACHE && point.attr(sc::A_CACHE_REASON) == Some(sc::V_REASON_SLIDE));
+
+    harness.state_mut().run("shape.insert", json!({"preset": "rect", "rect": [100.0, 100.0, 300.0, 200.0]})).unwrap();
+    harness.run_steps(3);
+
+    let after = points();
+    let reasoned_after = total(&after, |point| point.metric == sc::M_CACHE && point.attr(sc::A_CACHE_REASON) == Some(sc::V_REASON_SLIDE));
+    assert!(
+        reasoned_after > reasoned_before,
+        "the edit must invalidate the canvas texture with cache.reason={}: {reasoned_before} -> {reasoned_after}",
+        sc::V_REASON_SLIDE
+    );
+    assert!(
+        after.iter().any(|point| point.metric == sc::M_CACHE && point.attr(sc::A_CACHE_RESULT) == Some(sc::V_HIT)),
+        "no cache hit for the three unchanged frames before the edit: {:?}",
+        names(&after)
+    );
+    for phase in [sc::P_RASTER, sc::P_CONVERT, sc::P_UPLOAD] {
+        assert!(
+            after.iter().any(|point| point.metric == sc::M_FRAME_PHASE && point.attr(sc::A_PHASE) == Some(phase)),
+            "the miss must time its {phase} phase: {:?}",
+            names(&after)
+        );
+    }
 }

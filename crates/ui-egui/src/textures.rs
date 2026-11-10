@@ -10,7 +10,14 @@ use std::sync::Arc;
 use deckcraft_geom::Rect;
 use deckcraft_model::{Master, Presentation, ShapeId, Slide};
 use deckcraft_render::{Image, Region, RenderOpts};
+use deckcraft_telemetry::{instruments, sc};
 use egui::{ColorImage, TextureFilter, TextureHandle, TextureOptions, TextureWrapMode};
+use opentelemetry::KeyValue;
+
+/// How soon a second canvas miss on the same slide counts as thrash: about fifteen frames at
+/// 60 Hz, the same shape as the thumbnail-pane thrash behind #969 (the pane re-rendered the same
+/// rows while the *count* settled, so the work hid behind a cache that looked healthy).
+const THRASH_WINDOW_MS: f64 = 250.0;
 
 #[derive(Clone, PartialEq)]
 struct Key {
@@ -56,6 +63,11 @@ pub struct Textures {
     smartart: HashMap<String, TextureHandle>,
     clock: u64,
     pub last_render_ms: f64,
+    /// The last canvas miss's slide index and when it happened, for `texture.cache.thrash`.
+    last_miss: Option<(usize, f64)>,
+    /// `invalidate()` dropped the canvas texture: the next miss is attributed to it instead of to
+    /// a key field that did not change.
+    invalidated: bool,
 }
 
 impl Textures {
@@ -246,6 +258,27 @@ fn threads() -> u16 {
     if cfg!(target_arch = "wasm32") { 0 } else { std::thread::available_parallelism().map(|n| n.get().min(8) as u16).unwrap_or(0) }
 }
 
+/// Time one raster pass: wall time, output megapixels and the thread count it asked for.
+///
+/// `frame.phase.cpu_time` is deliberately **not** recorded. The CPU time of a raster belongs to
+/// the worker threads `vello_cpu` spawns; this crate has no thread-CPU clock without `unsafe`
+/// (forbidden) or a new dependency, and an `Instant` around the call measures wall time. Labelling
+/// that as CPU time would make the `cpu/wall` ratio a fabrication — the report marks it `n/a`
+/// instead of this crate inventing a number.
+fn record_raster(ms: f64, megapixels: f64, index: usize, scale: f64, threads: u16, second_pass: bool) {
+    let instruments = instruments();
+    let size = [KeyValue::new(sc::A_SLIDE_INDEX, index as i64), KeyValue::new(sc::A_RENDER_SCALE, scale)];
+    instruments.raster_pixels.record(megapixels, &size);
+    let mut attrs = Vec::with_capacity(5);
+    attrs.extend(size);
+    attrs.push(KeyValue::new(sc::A_RENDER_THREADS, i64::from(threads)));
+    attrs.push(KeyValue::new(sc::A_RENDER_SECOND_PASS, second_pass));
+    instruments.raster_duration.record(ms, &attrs);
+    // One histogram, one `phase` attribute — never a second instrument per phase.
+    attrs.push(KeyValue::new(sc::A_PHASE, sc::P_RASTER));
+    instruments.frame_phase.record(ms, &attrs);
+}
+
 impl Textures {
     /// The canvas texture for slide `index`, the slide being `size` pixels, and the region it
     /// covers: the slide, grown over the pasteboard to show what reaches off the slide within
@@ -296,9 +329,16 @@ impl Textures {
         if let Some(e) = &self.canvas
             && e.key == key
         {
+            // The hit path runs for every painted frame: a slice literal, never a `Vec` or a
+            // `format!`, so the measurement stays invisible next to the work it measures.
+            instruments().texture_cache.add(1, &[KeyValue::new(sc::A_CACHE_KIND, sc::V_CANVAS), KeyValue::new(sc::A_CACHE_RESULT, sc::V_HIT)]);
             return Some((e.tex.clone(), e.region));
         }
+        let reason = self.miss_reason(&key);
+        self.invalidated = false;
+        self.note_canvas_miss(index, reason);
         let t0 = crate::now_ms();
+        let render_threads = threads();
         let render = |region: Region| {
             let state_of = |id: ShapeId| anim.map(|(tl, time)| crate::preview::shape_state_at(tl, id, time)).unwrap_or_default();
             let state: Option<&dyn Fn(ShapeId) -> deckcraft_render::ShapeState> = if anim.is_some() { Some(&state_of) } else { None };
@@ -306,7 +346,7 @@ impl Textures {
                 scale,
                 edit,
                 gif_times,
-                threads: threads(),
+                threads: render_threads,
                 offset: region.offset(),
                 size: Some(region.size()),
                 state,
@@ -315,7 +355,10 @@ impl Textures {
             };
             deckcraft_render::render_slide_drawn(p, index, &opts)
         };
+        let megapixels = |region: Region| (region.w as f64 * region.h as f64) / 1.0e6;
+        let r0 = crate::now_ms();
         let (mut img, drawn) = render(want);
+        record_raster(crate::now_ms() - r0, megapixels(want), index, scale, render_threads, false);
         self.canvas_renders += 1;
         let mut region = want;
         // Text spilling out of its box can reach further than the boxes said. Once drawn, the
@@ -325,12 +368,26 @@ impl Textures {
             Key { want: fit_texture(deckcraft_render::pasteboard_region(size, scale, estimate.union(drawn), visible), visible, max_side), ..key };
         if !region.contains(&key.want) {
             region = key.want;
+            let r1 = crate::now_ms();
             img = render(region).0;
+            record_raster(crate::now_ms() - r1, megapixels(region), index, scale, render_threads, true);
             self.canvas_renders += 1;
         }
         self.drawn = Some((index, drawn));
+        // `render_ms` in `ui.inspect` (and `xtask bench`) has always been the raster alone:
+        // `to_color_image` and the texture upload stay outside this number by design, and the
+        // phase timings below are what make that exclusion visible instead of hidden.
         self.last_render_ms = crate::now_ms() - t0;
+        let c0 = crate::now_ms();
         let ci = to_color_image(&img, grayscale);
+        let convert_ms = crate::now_ms() - c0;
+        // The RGBA buffer the conversion built; `shrink_to` may cut it to the renderer's texture
+        // limit inside the upload, which is why this is the convert phase's payload, not the
+        // uploader's.
+        let bytes = img.width as f64 * img.height as f64 * 4.0;
+        instruments().texture_bytes.record(bytes, &[KeyValue::new(sc::A_CACHE_KIND, sc::V_CANVAS)]);
+        instruments().frame_phase.record(convert_ms, &[KeyValue::new(sc::A_PHASE, sc::P_CONVERT)]);
+        let u0 = crate::now_ms();
         let tex = match self.canvas.take() {
             Some(mut e) => {
                 replace_editor(ctx, &mut e.tex, ci);
@@ -338,8 +395,83 @@ impl Textures {
             }
             None => upload_editor(ctx, "slide-canvas", ci),
         };
+        instruments().frame_phase.record(crate::now_ms() - u0, &[KeyValue::new(sc::A_PHASE, sc::P_UPLOAD)]);
+        // `gpu.frame.time` is deliberately not recorded: the wgpu timestamp-query set lives inside
+        // the egui renderer this crate cannot reach, and a wall-clock upload labelled "GPU time"
+        // would be exactly the fabricated number this instrumentation exists to replace.
+        //
+        // The first canvas texture is the editor's first contentful paint — the LCP analogue —
+        // recorded once per process in ms since the clock origin (`now_ms`'s first read).
+        static FIRST_CANVAS: std::sync::Once = std::sync::Once::new();
+        FIRST_CANVAS.call_once(|| {
+            instruments().largest_paint.record(crate::now_ms(), &[KeyValue::new(sc::A_CONTENT_TYPE, sc::V_CONTENT_SLIDE_CANVAS)]);
+        });
         self.canvas = Some(Entry { key, tex: tex.clone(), region, _slide: slide, _master: master, stamp: 0 });
         Some((tex, region))
+    }
+
+    /// Which part of the cache key invalidated the canvas texture.
+    ///
+    /// The `slide` and `master` fields *are* the `Arc` addresses: the model is immutable behind
+    /// `Arc`, so any edit to the slide hands the canvas a new `Arc` and moving that pointer is
+    /// exactly "the content changed". `None` means a cold cache — there is no previous key to
+    /// blame, and labelling it with a field that did not change would put a wrong reason on the
+    /// report. `invalidate()` is the one explicit cause, and it names itself.
+    fn miss_reason(&self, key: &Key) -> Option<&'static str> {
+        if self.invalidated {
+            return Some(sc::V_REASON_INVALIDATE);
+        }
+        let previous = &self.canvas.as_ref()?.key;
+        if previous.slide != key.slide || previous.master != key.master {
+            Some(sc::V_REASON_SLIDE)
+        } else if previous.size != key.size {
+            Some(sc::V_REASON_SIZE)
+        } else if previous.want != key.want {
+            Some(sc::V_REASON_REGION)
+        } else if previous.edit != key.edit {
+            Some(sc::V_REASON_EDIT)
+        } else if previous.extra != key.extra {
+            Some(sc::V_REASON_EXTRA)
+        } else if previous.editing_text != key.editing_text {
+            Some(sc::V_REASON_EDITING_TEXT)
+        } else {
+            None
+        }
+    }
+
+    /// Count a canvas miss, name why the cached texture was unusable, and flag repeated misses.
+    ///
+    /// The counter feeds the report, the span event places the miss inside the frame that paid for
+    /// it, and the log line survives when only logs are exported. The miss path runs once per
+    /// change, not per frame, so the `Vec` here is not a hot-path allocation.
+    fn note_canvas_miss(&mut self, index: usize, reason: Option<&'static str>) {
+        let mut attrs = Vec::with_capacity(3);
+        attrs.push(KeyValue::new(sc::A_CACHE_KIND, sc::V_CANVAS));
+        attrs.push(KeyValue::new(sc::A_CACHE_RESULT, sc::V_MISS));
+        match reason {
+            Some(reason) => {
+                attrs.push(KeyValue::new(sc::A_CACHE_REASON, reason));
+                deckcraft_telemetry::spans::event(
+                    sc::E_CACHE_MISS,
+                    vec![KeyValue::new(sc::A_CACHE_REASON, reason), KeyValue::new(sc::A_SLIDE_INDEX, index as i64)],
+                );
+                log::debug!(cache_kind = sc::V_CANVAS, cache_reason = reason, slide_index = index as i64; "canvas texture cache miss");
+            }
+            None => {
+                log::debug!(cache_kind = sc::V_CANVAS, slide_index = index as i64; "canvas texture cache cold miss");
+            }
+        }
+        instruments().texture_cache.add(1, &attrs);
+        let now = crate::now_ms();
+        if let Some((last_index, last_at)) = self.last_miss
+            && last_index == index
+            && now - last_at < THRASH_WINDOW_MS
+        {
+            // The same slide was rebuilt again a few frames later: the cache is not holding what
+            // the canvas asks for, which is the failure #969 described for the thumbnail pane.
+            instruments().texture_thrash.add(1, &[KeyValue::new(sc::A_SLIDE_INDEX, index as i64)]);
+        }
+        self.last_miss = Some((index, now));
     }
 
     /// Cached thumbnails (bounded; soak tests check it).
@@ -359,6 +491,8 @@ impl Textures {
         self.estimate = None;
         self.drawn = None;
         self.thumbs.clear();
+        // The next miss has no key field to blame: it is this call that emptied the cache.
+        self.invalidated = true;
     }
 
     /// A thumbnail texture; renders at most `budget` new thumbnails per frame. Over budget it
