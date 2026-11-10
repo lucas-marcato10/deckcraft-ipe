@@ -1,0 +1,13 @@
+[package]
+name = "deckcraft-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenTelemetry semantic conventions and instrument handles for DeckCraft frame diagnostics"
+
+[lints]
+workspace = true
+
+[dependencies]
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-semantic-conventions = "=0.33.1"
