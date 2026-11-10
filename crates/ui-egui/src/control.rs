@@ -246,6 +246,8 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                     modifiers: egui::Modifiers::NONE,
                 });
             }
+            // The control server already counted the wake that brought this request (it is the one
+            // place the channel wakes the UI); this call only makes the scheduled frame happen.
             ctx.request_repaint();
             ok(json!({"queued": app.synthetic_queued_len()}))
         }

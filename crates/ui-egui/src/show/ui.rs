@@ -481,7 +481,7 @@ fn draw_transition(show: &mut Show, f: &Fr, sl: &Sl, painter: &egui::Painter, te
         painter.image(frame.id(), srect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         tr.morph = Some(frame);
         drew = true;
-        ctx.request_repaint();
+        crate::repaint::continuous(ctx);
     } else if let (Some(tr), Some(new)) = (show.trans.as_mut(), &tex) {
         let p = ((now - tr.start) / tr.dur.max(0.01)).clamp(0.0, 1.0);
         if p < 1.0 {
@@ -528,7 +528,7 @@ fn draw_transition(show: &mut Show, f: &Fr, sl: &Sl, painter: &egui::Painter, te
                 painter.add(egui::Shape::mesh(mesh));
             }
             drew = true;
-            ctx.request_repaint();
+            crate::repaint::continuous(ctx);
         }
     }
     drew
@@ -678,7 +678,7 @@ fn draw_slide(app: &mut SlideApp, ui: &mut Ui, show: &mut Show, f: &Fr, painter:
             draw_media_controls(app, ui, show, f, &sl, painter);
         }
         if sl.animating {
-            ctx.request_repaint();
+            crate::repaint::continuous(ctx);
         }
     }
 }

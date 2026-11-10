@@ -7,8 +7,11 @@ use super::updates_ui;
 use super::{
     AnimPreview, ControlRequest, FileTarget, HashMap, ImeCancelled, ImeComposition, ImeResetPhase, ImeTerminalPending, InputTarget, Mods,
     PendingFile, Perf, Receiver, Session, SlideApp, Target, UI_COMMANDS, UiRequest, Value, backstage, canvas, capture, dialogs, doc_window,
-    eyedropper, json, media, menus, notes, panes, preview, qat, ribbon, selpane, show, sorter, status, textures, theme, thumbs, toast, uifonts,
+    eyedropper, json, media, menus, notes, panes, preview, qat, repaint, ribbon, selpane, show, sorter, status, textures, theme, thumbs, toast,
+    uifonts,
 };
+use deckcraft_telemetry::sc;
+use opentelemetry::KeyValue;
 
 mod clipboard;
 mod commands;
@@ -38,6 +41,11 @@ impl SlideApp {
     /// Build application UI state, taking ownership of audio output and initialising media, dialogs,
     /// synthetic input, and timing fields.
     pub fn new(session: Session, mut services: Services) -> Self {
+        // Tests need the in-memory OTel pipeline installed *before* the first frame binds the
+        // shared instrument handles: a handle built while the global meter is the default no-op
+        // provider stays no-op for the whole process. Nothing runs here in a shipped build.
+        #[cfg(test)]
+        crate::otel_frame_tests::pipeline();
         let audio_out = services.audio_out.take();
         SlideApp {
             last_fill: serde_json::json!("accent1"),
@@ -60,6 +68,8 @@ impl SlideApp {
             toast: None,
             fonts_noted: Default::default(),
             perf: Perf { frame_ms: 0.0, render_ms: 0.0, fps: 0.0 },
+            last_frame_ms: None,
+            frame_id: 0,
             synthetic: vec![],
             synthetic_pending: false,
             synthetic_next: vec![],
@@ -236,7 +246,7 @@ impl SlideApp {
         // rely on the screenshot command and the completion callback, with only a deadline wake.
         self.capture.request_paint_if_needed(ctx, web_time::Instant::now());
         if !self.synthetic.is_empty() || !self.synthetic_next.is_empty() || self.synthetic_pending {
-            ctx.request_repaint();
+            repaint::synthetic(ctx);
         }
         // Closing the window with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed && self.session.documents().iter().any(|d| d.is_dirty()) {
@@ -291,31 +301,27 @@ impl SlideApp {
             return;
         }
         let t0 = now_ms();
+        self.frame_id = self.frame_id.wrapping_add(1);
+        // One root span per painted frame; every phase below is a child of it, so a trace answers
+        // "which part of this frame was slow" instead of requiring a timestamp correlation.
+        let attrs = vec![KeyValue::new(sc::A_FRAME_ID, self.frame_id as i64), KeyValue::new(sc::A_FRAME_BUDGET_MS, sc::FRAME_BUDGET_MS)];
+        deckcraft_telemetry::spans::frame_span(attrs, |_cx| self.frame_body(ui));
+        // Exactly one close: every route through the body returns normally, so the frame's
+        // instruments are recorded once, including on the show-mode path that used to `return`
+        // early with its own `perf.frame_ms`.
+        self.finish_frame(t0);
+    }
+
+    /// Everything one painted frame does, inside its `deckcraft.frame` span.
+    fn frame_body(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let t = theme::Tokens::get(&ctx);
-        self.note_ui_text(&ctx);
-        self.media.sync_video_textures(&ctx);
-        canvas::trackpad_twist(self, &ctx);
-        eyedropper::tick(self, &ctx);
-        self.opening_ui(&ctx);
-        if self.show.is_some() {
-            self.anim_preview = None;
-            show::ui(self, ui);
-            doc_window::show(self, &ctx);
-            self.perf.frame_ms = now_ms() - t0;
+        let build_start = now_ms();
+        let shown = deckcraft_telemetry::spans::phase_span(sc::P_BUILD, || self.frame_build(ui));
+        deckcraft_telemetry::instruments().frame_phase.record(now_ms() - build_start, &[KeyValue::new(sc::A_PHASE, sc::P_BUILD)]);
+        if shown {
             self.ui_end(&ctx);
             return;
-        }
-        self.sync_backstage();
-        self.keyboard(&ctx);
-        self.sync_backstage();
-        ribbon::title_bar(self, ui);
-        if self.backstage.is_none() && self.session.active().is_some() {
-            ribbon::show(self, ui);
-            status::status_bar(self, ui);
-        }
-        let now = ui.input(|i| i.time);
-        if self.tick_anim_preview(now) {
-            ctx.request_repaint();
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
             if self.backstage.is_some() {
@@ -342,7 +348,13 @@ impl SlideApp {
                         if self.ui.notes {
                             status::notes_pane(self, ui);
                         }
-                        canvas::show(self, ui);
+                        deckcraft_telemetry::spans::phase_span(sc::P_PRESENT, || {
+                            let present_start = now_ms();
+                            canvas::show(self, ui);
+                            deckcraft_telemetry::instruments()
+                                .frame_phase
+                                .record(now_ms() - present_start, &[KeyValue::new(sc::A_PHASE, sc::P_PRESENT)]);
+                        });
                     });
                 }
             }
@@ -361,8 +373,59 @@ impl SlideApp {
         }
         self.drain_requests();
         doc_window::show(self, &ctx);
-        self.perf.frame_ms = now_ms() - t0;
         self.ui_end(&ctx);
+    }
+
+    /// The layout half of a frame: everything before the central panel paints, plus show mode,
+    /// which paints the whole screen here. Returns true when show mode handled the frame (the
+    /// early return it used to take now ends this function instead of the frame).
+    fn frame_build(&mut self, ui: &mut egui::Ui) -> bool {
+        let ctx = ui.ctx().clone();
+        self.note_ui_text(&ctx);
+        self.media.sync_video_textures(&ctx);
+        canvas::trackpad_twist(self, &ctx);
+        eyedropper::tick(self, &ctx);
+        self.opening_ui(&ctx);
+        if self.show.is_some() {
+            self.anim_preview = None;
+            show::ui(self, ui);
+            doc_window::show(self, &ctx);
+            return true;
+        }
+        self.sync_backstage();
+        self.keyboard(&ctx);
+        self.sync_backstage();
+        ribbon::title_bar(self, ui);
+        if self.backstage.is_none() && self.session.active().is_some() {
+            ribbon::show(self, ui);
+            status::status_bar(self, ui);
+        }
+        let now = ui.input(|i| i.time);
+        if self.tick_anim_preview(now) {
+            repaint::anim_preview(&ctx);
+        }
+        false
+    }
+
+    /// Close a painted frame: `Perf` (unchanged, for `ui.inspect` and `xtask bench`) plus the
+    /// frame's OpenTelemetry instruments.
+    fn finish_frame(&mut self, t0: f64) {
+        let frame_ms = (now_ms() - t0).max(0.0);
+        self.perf.frame_ms = frame_ms;
+        let instruments = deckcraft_telemetry::instruments();
+        instruments.frame_duration.record(frame_ms, &[]);
+        // The interval between two frame starts; the first frame has no predecessor and records
+        // no delta rather than a fake zero.
+        if let Some(previous) = self.last_frame_ms {
+            instruments.frame_delta.record((t0 - previous).max(0.0), &[]);
+        }
+        self.last_frame_ms = Some(t0);
+        if frame_ms > sc::FRAME_BUDGET_MS {
+            // Missed the 60 Hz budget. The finer classes (dropped frame, long task) need the
+            // presentation timestamps the pacing work owns; guessing one here would be worse than
+            // the coarse class that is certainly true.
+            instruments.frame_janky.add(1, &[KeyValue::new(sc::A_JANK_CLASS, sc::V_JANK_MISSED_VSYNC)]);
+        }
     }
 
     pub fn open_url(&mut self, url: &str) {

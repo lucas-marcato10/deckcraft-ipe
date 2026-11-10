@@ -11,6 +11,10 @@ impl SlideApp {
             if !req.take() {
                 continue;
             }
+            // A request the UI consumes is a frame the control channel caused, so it counts as a
+            // `repaint.source=control` wake. A request that timed out above never reached a frame
+            // and is deliberately not counted.
+            crate::repaint::control_consumed();
             let reply = req.reply.clone();
             let revision = self.session.active().map(|d| d.revision);
             match control::handle(self, ctx, &req) {

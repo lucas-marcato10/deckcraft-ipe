@@ -25,6 +25,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
+# Frame and texture instrumentation: instrument handles come from `deckcraft-telemetry` (L0), the
+# `KeyValue` attributes from the OTel API. No SDK here — the app installs it at its boundary.
+deckcraft-telemetry = { workspace = true }
+opentelemetry = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 craft-update = { workspace = true }
@@ -34,6 +38,9 @@ skrifa = { workspace = true }
 # kittest's own dev-dependencies do not propagate; tests need both font features explicitly.
 egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+# `testing` adds `InMemoryMetricExporter`: the only way to read back what the meter provider
+# actually recorded. A dev-dependency, so the shipped binary never links the SDK test helpers.
+opentelemetry_sdk = { version = "=0.33.1", features = ["testing"] }
 
 [build-dependencies]
 serde_json = { workspace = true }

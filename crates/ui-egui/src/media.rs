@@ -438,7 +438,7 @@ pub fn gif_key(gifs: &[Gif]) -> u64 {
 /// Come back when the next frame of a playing GIF is due.
 pub fn gif_repaint(ctx: &egui::Context, gifs: &[Gif]) {
     if let Some(next) = gifs.iter().filter(|g| !g.paused).map(|g| g.next).reduce(f64::min) {
-        ctx.request_repaint_after(std::time::Duration::from_millis((next * 1000.0).clamp(5.0, 1000.0) as u64));
+        crate::repaint::gif_after(ctx, std::time::Duration::from_millis((next * 1000.0).clamp(5.0, 1000.0) as u64));
     }
 }
 

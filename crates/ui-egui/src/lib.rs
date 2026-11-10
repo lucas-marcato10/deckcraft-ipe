@@ -52,6 +52,7 @@ mod app;
 mod clock;
 mod ime_hooks;
 pub mod panels;
+mod repaint;
 mod services;
 mod state;
 
@@ -246,6 +247,11 @@ pub struct SlideApp {
     /// Documents (by uid) whose missing fonts have been mentioned.
     fonts_noted: std::collections::HashSet<u64>,
     pub perf: Perf,
+    /// Start of the previous painted frame (`now_ms`), for `frame.delta`; `None` before the second
+    /// frame. A frame-to-frame interval needs two frame starts, which is why this is not `perf`.
+    last_frame_ms: Option<f64>,
+    /// Painted frames so far: the `frame.id` span attribute that ties a trace to a log line.
+    frame_id: u64,
     /// Synthetic input events (control channel `ui.click` etc.), injected one per frame.
     pub(crate) synthetic: Vec<egui::Event>,
     /// A synthetic batch has been injected but the UI pass has not acknowledged it. While this
@@ -492,6 +498,9 @@ mod inbox_tests;
 
 #[cfg(test)]
 mod host_save_tests;
+
+#[cfg(test)]
+mod otel_frame_tests;
 
 #[cfg(test)]
 mod tests;
