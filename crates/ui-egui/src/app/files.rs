@@ -2,6 +2,16 @@ use super::{
     FilePlace, FilePurpose, FileTarget, InboxEvent, LocatedPlace, PendingFile, RECENT_MAX, SlideApp, Target, UiRequest, Value, ViewMode, dialogs,
     json, media,
 };
+use deckcraft_telemetry::sc;
+
+/// Run `body` as a named main-thread task: the histogram entry and any long-task event come from the
+/// same elapsed time, so attribution and the trace cannot disagree.
+fn timed_task<T>(app: &mut SlideApp, name: &'static str, body: impl FnOnce(&mut SlideApp) -> T) -> T {
+    let started = crate::now_ms();
+    let out = body(app);
+    crate::tasks::record(name, started);
+    out
+}
 
 #[derive(Default)]
 pub(crate) struct PrintPreviews(Vec<std::path::PathBuf>);
@@ -210,7 +220,10 @@ impl SlideApp {
             if let (Some(o), Some(x)) = (params.as_object_mut(), extra.as_object()) {
                 o.extend(x.clone());
             }
-            return match self.run("file.export", params) {
+            // The PDF export is the 294 ms stall `cargo xtask bench` measured: named, so the frame
+            // that waited for it has an attribution.
+            let name = if format == "pdf" { sc::V_TASK_EXPORT_PDF } else { sc::V_TASK_EXPORT };
+            return match timed_task(self, name, |app| app.run("file.export", params)) {
                 Ok(_) => {
                     self.set_status(format!("Exported {path}"));
                     true
@@ -230,9 +243,9 @@ impl SlideApp {
                 }
                 return any;
             }
-            "pdf" => deckcraft_engine::cmd::file::pdf_bytes(&doc, &extra),
-            "gif" => deckcraft_engine::cmd::file::gif_bytes(&doc, &extra),
-            other => deckcraft_engine::cmd::file::save_bytes(&doc, other),
+            "pdf" => timed_task(self, sc::V_TASK_EXPORT_PDF, |_app| deckcraft_engine::cmd::file::pdf_bytes(&doc, &extra)),
+            "gif" => timed_task(self, sc::V_TASK_EXPORT, |_app| deckcraft_engine::cmd::file::gif_bytes(&doc, &extra)),
+            other => timed_task(self, sc::V_TASK_EXPORT, |_app| deckcraft_engine::cmd::file::save_bytes(&doc, other)),
         };
         self.download(&suggested, bytes)
     }
@@ -279,7 +292,7 @@ impl SlideApp {
             o.insert("path".into(), json!(path));
             o.insert("format".into(), json!("pdf"));
         }
-        match self.run("file.export", params) {
+        match timed_task(self, sc::V_TASK_EXPORT_PDF, |app| app.run("file.export", params)) {
             Ok(_) => {
                 self.open_url(&format!("file:///{}", path.replace('\\', "/").trim_start_matches('/')));
                 self.set_status("Opened the presentation as a PDF to print");
@@ -306,7 +319,10 @@ impl SlideApp {
     }
 
     pub fn open_path(&mut self, path: &str) -> Result<(), String> {
-        self.session.execute("file.open", &json!({"path": path})).map_err(|e| e.to_string())?;
+        // Reading, parsing and laying out a deck is main-thread work while it happens here: naming
+        // it separates "opening a 200-slide deck" from "the editor is slow".
+        let opened = timed_task(self, sc::V_TASK_OPEN, |app| app.session.execute("file.open", &json!({"path": path})));
+        opened.map_err(|e| e.to_string())?;
         self.note_recent(path);
         Ok(())
     }

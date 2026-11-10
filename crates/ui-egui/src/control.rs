@@ -34,6 +34,10 @@ pub struct ControlRequest {
     /// Who has the request: [`PENDING`], [`TAKEN`] (the app runs it) or [`ABANDONED`] (the
     /// sender gave up on it, so the app must not run it late: issue #719).
     pub state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// When the request arrived, on the app's monotonic clock. The wait between arrival and the
+    /// handler that runs it is `inp.input_delay` — the one phase the app can observe honestly for
+    /// the control channel, and the only one it cannot observe at all for a native OS event.
+    pub arrived_ms: f64,
 }
 
 /// Queued, not yet run.
@@ -46,7 +50,7 @@ pub const ABANDONED: u8 = 2;
 impl ControlRequest {
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx, state: Default::default() }, rx)
+        (Self { method: method.into(), params, reply: tx, state: Default::default(), arrived_ms: crate::now_ms() }, rx)
     }
 
     /// Claim the request for running; false when its sender already gave up on it.
@@ -151,18 +155,9 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
         "ui.pointer" => {
             let Some(events) = p.get("events").and_then(Value::as_array) else { return err("missing `events`") };
             let base = p.get("mods").map(mods_from).unwrap_or_default();
-            // The gesture is timed on egui's clock — the same one the frame that closes it reads —
-            // so the three INP phases share one monotonic base. The request is handled here in
-            // `logic`, before the UI pass: the wait until that pass is real `presentation` time.
-            let t_input = ctx.input(|i| i.time) * 1000.0;
-            let interaction = app.interaction_begin(sc::V_INTERACTION_DRAG, t_input);
-            app.interaction_dispatched(&interaction, t_input);
-            // Every event after the first is collapsed into the same paint. Non-zero means this
-            // request cannot price per-frame pointer cost (the collapsed-gesture trap).
-            deckcraft_telemetry::instruments()
-                .interaction_coalesced
-                .add(events.len().saturating_sub(1) as u64, &[KeyValue::new(sc::A_INTERACTION_TYPE, sc::V_INTERACTION_DRAG)]);
-            let mut last = Value::Null;
+            // Parse every event before opening the interaction: a malformed request must not leave
+            // a pending interaction that a later frame paints as if the gesture had happened.
+            let mut batch = Vec::with_capacity(events.len());
             for e in events {
                 let kind = e.get("kind").and_then(Value::as_str).unwrap_or("");
                 let Some(kind) = deckcraft_mcp_kind(kind) else { return err(format!("unknown pointer kind `{kind}`")) };
@@ -171,19 +166,38 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 };
                 let mods = e.get("mods").map(mods_from).unwrap_or(base);
                 let pressure = e.get("pressure").and_then(Value::as_f64).map(|v| v as f32);
-                match app.session.pointer(PointerEvent { kind, x, y, mods, tol: (4.0 / app.canvas_scale.max(0.05)) as f64, pressure }) {
+                // `tol` is filled per dispatch, from the canvas scale at that moment.
+                batch.push(PointerEvent { kind, x, y, mods, tol: 0.0, pressure });
+            }
+            // One clock for all three phases: `now_ms`, the same one `finish_frame` closes the
+            // interaction with. `arrived_ms` is when the line reached the server, so the wait in
+            // the queue is a real `input_delay` (egui's `i.time` is a different time base and
+            // subtracting the two clamps every phase to zero).
+            let t_input = req.arrived_ms;
+            let interaction = app.interaction_begin(sc::V_INTERACTION_DRAG, t_input);
+            app.interaction_dispatched(&interaction, crate::now_ms());
+            // Every event after the first is collapsed into the same paint. Non-zero means this
+            // request cannot price per-frame pointer cost (the collapsed-gesture trap).
+            deckcraft_telemetry::instruments()
+                .interaction_coalesced
+                .add(batch.len().saturating_sub(1) as u64, &[KeyValue::new(sc::A_INTERACTION_TYPE, sc::V_INTERACTION_DRAG)]);
+            let tol = (4.0 / app.canvas_scale.max(0.05)) as f64;
+            let mut last = Value::Null;
+            for mut event in batch {
+                event.tol = tol;
+                match app.session.pointer(event) {
                     Ok(v) => last = v,
                     Err(e) => return err(e),
                 }
             }
-            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
+            app.interaction_processed(&interaction, crate::now_ms());
             ok(json!({"result": last, "selection": app.session.active().map(|d| serde_json::to_value(&d.selection).unwrap_or_default())}))
         }
         "ui.key" => {
             let Some(k) = s("key") else { return err("missing `key`") };
-            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let t_input = req.arrived_ms;
             let interaction = app.interaction_begin(sc::V_INTERACTION_KEY, t_input);
-            app.interaction_dispatched(&interaction, t_input);
+            app.interaction_dispatched(&interaction, crate::now_ms());
             let outcome = (|| {
                 if app.anim_preview_active() && app.show.is_none() && matches!(k.to_ascii_lowercase().as_str(), "escape" | "esc") {
                     app.stop_anim_preview();
@@ -199,16 +213,16 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 }
                 wrap(app.session.key(k, mods_from(p)).map_err(|e| e.to_string()))
             })();
-            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
+            app.interaction_processed(&interaction, crate::now_ms());
             outcome
         }
         "ui.text" => {
             let Some(t) = s("text") else { return err("missing `text`") };
-            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let t_input = req.arrived_ms;
             let interaction = app.interaction_begin(sc::V_INTERACTION_TEXT, t_input);
-            app.interaction_dispatched(&interaction, t_input);
+            app.interaction_dispatched(&interaction, crate::now_ms());
             let outcome = wrap(app.session.type_text(t).map_err(|e| e.to_string()));
-            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
+            app.interaction_processed(&interaction, crate::now_ms());
             outcome
         }
         "ui.ime" => {
@@ -225,11 +239,11 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
             } else {
                 return err("missing `preedit` or `commit`");
             };
-            let t_input = ctx.input(|i| i.time) * 1000.0;
+            let t_input = req.arrived_ms;
             let interaction = app.interaction_begin(sc::V_INTERACTION_IME, t_input);
-            app.interaction_dispatched(&interaction, t_input);
+            app.interaction_dispatched(&interaction, crate::now_ms());
             app.queue_input(egui::Event::Ime(ev));
-            app.interaction_processed(&interaction, ctx.input(|i| i.time) * 1000.0);
+            app.interaction_processed(&interaction, crate::now_ms());
             ok(json!({"queued": true}))
         }
         "ui.tool.select" => {
@@ -285,9 +299,9 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 None
             };
             let interaction = kind.map(|kind| {
-                let t_input = ctx.input(|i| i.time) * 1000.0;
+                let t_input = req.arrived_ms;
                 let key = app.interaction_begin(kind, t_input);
-                app.interaction_dispatched(&key, t_input);
+                app.interaction_dispatched(&key, crate::now_ms());
                 // The queued events are painted by one frame: the same collapse `ui.pointer`
                 // reports, and the same reason a "drag was free" reading may be a false negative.
                 deckcraft_telemetry::instruments()
@@ -302,7 +316,7 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
             // place the channel wakes the UI); this call only makes the scheduled frame happen.
             ctx.request_repaint();
             if let Some(key) = interaction {
-                app.interaction_processed(&key, ctx.input(|i| i.time) * 1000.0);
+                app.interaction_processed(&key, crate::now_ms());
             }
             ok(json!({"queued": app.synthetic_queued_len()}))
         }

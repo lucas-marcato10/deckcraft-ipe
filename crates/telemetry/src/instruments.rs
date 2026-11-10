@@ -73,11 +73,16 @@ pub struct Instruments {
     /// `request_repaint*` calls, discriminated by `repaint.source`.
     pub repaint_requested: Counter<u64>,
     /// Records the pipeline itself dropped; non-zero invalidates the run.
+    ///
+    /// Deliberately never recorded: SDK 0.33.1 publishes no batch-processor drop counter, and a
+    /// fabricated zero would be the one number the whole measurement depends on being true.
     pub dropped_records: Counter<u64>,
     /// Cost of exporting telemetry — feeds the overhead guard.
     pub export_duration: Histogram<f64>,
     /// Time to first frame (FCP analogue).
     pub time_to_first_frame: Histogram<f64>,
+    /// Time to the first accepted input (TTI) — painted is not the same as responding.
+    pub time_to_interactive: Histogram<f64>,
     /// Time to the first full canvas paint (LCP analogue).
     pub largest_paint: Histogram<f64>,
     /// Resident set size.
@@ -125,6 +130,7 @@ impl Instruments {
             dropped_records: meter.u64_counter(sc::M_DROPPED_RECORDS).with_unit(sc::U_ONE).build(),
             export_duration: hist(meter, sc::M_EXPORT_DURATION, "OTLP export duration", sc::U_MS, f.clone()),
             time_to_first_frame: hist(meter, sc::M_TTF_FIRST_FRAME, "Time to first frame", sc::U_MS, f.clone()),
+            time_to_interactive: hist(meter, sc::M_TTI_INTERACTIVE, "Time to first accepted input", sc::U_MS, f.clone()),
             largest_paint: hist(meter, sc::M_LARGEST_PAINT, "Largest contentful paint", sc::U_MS, i),
             memory_rss: meter.f64_gauge(sc::M_MEMORY_RSS).with_unit(sc::U_BY).build(),
             binary_size: meter.f64_gauge(sc::M_BINARY_SIZE).with_unit(sc::U_BY).build(),

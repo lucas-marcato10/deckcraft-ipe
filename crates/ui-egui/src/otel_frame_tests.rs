@@ -63,7 +63,10 @@ fn reader() -> MutexGuard<'static, ()> {
 struct Point {
     metric: String,
     attrs: Vec<(String, String)>,
+    /// The histogram sample count (the accumulation of a sum or gauge, for those kinds).
     value: f64,
+    /// The histogram's recorded values summed. Zero for counters, where `value` is the sum.
+    sum: f64,
 }
 
 impl Point {
@@ -73,7 +76,13 @@ impl Point {
 }
 
 fn push<'a>(out: &mut Vec<Point>, metric: &str, attrs: impl Iterator<Item = &'a KeyValue>, value: f64) {
-    out.push(Point { metric: metric.to_owned(), attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(), value });
+    out.push(Point { metric: metric.to_owned(), attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(), value, sum: 0.0 });
+}
+
+/// A histogram data point: its sample count and the sum of the samples, so a test can tell "it
+/// recorded" from "it recorded a real number".
+fn push_hist<'a>(out: &mut Vec<Point>, metric: &str, attrs: impl Iterator<Item = &'a KeyValue>, count: f64, sum: f64) {
+    out.push(Point { metric: metric.to_owned(), attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(), value: count, sum });
 }
 
 /// Every data point the in-memory exporter holds after a forced collection.
@@ -94,7 +103,7 @@ fn points() -> Vec<Point> {
                     AggregatedMetrics::F64(data) => match data {
                         MetricData::Histogram(hist) => {
                             for point in hist.data_points() {
-                                push(&mut out, name, point.attributes(), point.count() as f64);
+                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum());
                             }
                         }
                         MetricData::Sum(sum) => {
@@ -109,14 +118,14 @@ fn points() -> Vec<Point> {
                         }
                         MetricData::ExponentialHistogram(hist) => {
                             for point in hist.data_points() {
-                                push(&mut out, name, point.attributes(), point.count() as f64);
+                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum());
                             }
                         }
                     },
                     AggregatedMetrics::U64(data) => match data {
                         MetricData::Histogram(hist) => {
                             for point in hist.data_points() {
-                                push(&mut out, name, point.attributes(), point.count() as f64);
+                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
                             }
                         }
                         MetricData::Sum(sum) => {
@@ -131,14 +140,14 @@ fn points() -> Vec<Point> {
                         }
                         MetricData::ExponentialHistogram(hist) => {
                             for point in hist.data_points() {
-                                push(&mut out, name, point.attributes(), point.count() as f64);
+                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
                             }
                         }
                     },
                     AggregatedMetrics::I64(data) => match data {
                         MetricData::Histogram(hist) => {
                             for point in hist.data_points() {
-                                push(&mut out, name, point.attributes(), point.count() as f64);
+                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
                             }
                         }
                         MetricData::Sum(sum) => {
@@ -153,7 +162,7 @@ fn points() -> Vec<Point> {
                         }
                         MetricData::ExponentialHistogram(hist) => {
                             for point in hist.data_points() {
-                                push(&mut out, name, point.attributes(), point.count() as f64);
+                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
                             }
                         }
                     },
@@ -175,6 +184,12 @@ fn names(points: &[Point]) -> Vec<&str> {
 /// The summed value of every data point matching `wanted`.
 fn total(points: &[Point], wanted: impl Fn(&Point) -> bool) -> f64 {
     points.iter().filter(|point| wanted(point)).map(|point| point.value).sum()
+}
+
+/// The sum of the recorded samples of every histogram data point matching `wanted` — the actual
+/// milliseconds, not the number of samples.
+fn total_sum(points: &[Point], wanted: impl Fn(&Point) -> bool) -> f64 {
+    points.iter().filter(|point| wanted(point)).map(|point| point.sum).sum()
 }
 
 fn harness() -> egui_kittest::Harness<'static, SlideApp> {
@@ -272,6 +287,130 @@ fn a_pointer_gesture_through_the_control_channel_reports_inp_and_its_three_phase
         "three events painted by one frame must report two coalesced events: {:?}",
         names(&after)
     );
+    // A sample of 0 ms is not a fast interaction, it is a broken clock: two different time bases
+    // (egui's input time and the process clock) subtract to a negative number that the phase
+    // clamp turns into zero. The sample must carry real milliseconds.
+    let drag_ms = total_sum(&after, |point| point.metric == sc::M_INTERACTION_DURATION && point.attr(sc::A_INTERACTION_TYPE) == Some("drag"))
+        - total_sum(&before, |point| point.metric == sc::M_INTERACTION_DURATION && point.attr(sc::A_INTERACTION_TYPE) == Some("drag"));
+    assert!(drag_ms > 0.0, "the INP sample is {drag_ms} ms — the phases were clamped from a clock mismatch: {:?}", names(&after));
+}
+
+/// A frame that misses its vsync must emit a pacing error and the `late` tearing proxy. The
+/// display interval is forced absurdly small so every harness frame is late: the verdict is
+/// arithmetic on real timestamps, so this exercises the emission, not a stub.
+#[test]
+fn a_late_frame_emits_a_pacing_error_and_the_tearing_proxy() {
+    let _reading = reader();
+    let mut harness = harness();
+    harness.run_steps(2);
+    // 0.01 ms per display interval: any real frame exceeds one and a half intervals.
+    harness.state_mut().display_interval_ms = 0.01;
+
+    let before = points();
+    let error_before = total(&before, |point| point.metric == sc::M_PACING_ERROR);
+    let late_before = total(&before, |point| point.metric == sc::M_FRAME_LATE);
+    harness.run_steps(3);
+    let after = points();
+
+    assert!(
+        total(&after, |point| point.metric == sc::M_PACING_ERROR) - error_before >= 3.0,
+        "three late frames must each record a pacing error: {:?}",
+        names(&after)
+    );
+    assert!(
+        total(&after, |point| point.metric == sc::M_FRAME_LATE) - late_before >= 3.0,
+        "three late frames must each count as late: {:?}",
+        names(&after)
+    );
+}
+
+/// Startup is two different promises: the first frame is painted, and the app accepts its first
+/// input. Both are once per process and both are measured from the instant `main()` took, not from
+/// the app's construction — the wait before it is part of what the user felt.
+#[test]
+fn startup_reports_time_to_first_frame_and_to_first_accepted_input() {
+    let _reading = reader();
+    let mut harness = harness();
+    // The process "started" a second ago: a sample must exist and be at least that large.
+    let started = web_time::Instant::now() - std::time::Duration::from_secs(1);
+    harness.state_mut().mark_process_start(started);
+
+    let before = points();
+    let frame_before = total(&before, |point| point.metric == sc::M_TTF_FIRST_FRAME);
+    let input_before = total(&before, |point| point.metric == sc::M_TTI_INTERACTIVE);
+    harness.run_steps(2);
+
+    let (request, _reply) = crate::control::ControlRequest::new("ui.key", json!({"key": "right"}));
+    let ctx = harness.ctx.clone();
+    let outcome = crate::control::handle(harness.state_mut(), &ctx, &request);
+    assert!(matches!(outcome, crate::control::Outcome::Done(_)), "the control request must be accepted");
+    harness.run_steps(2);
+
+    let after = points();
+    assert!(
+        total(&after, |point| point.metric == sc::M_TTF_FIRST_FRAME) - frame_before >= 1.0,
+        "no {} sample: {:?}",
+        sc::M_TTF_FIRST_FRAME,
+        names(&after)
+    );
+    assert!(
+        total(&after, |point| point.metric == sc::M_TTI_INTERACTIVE) - input_before >= 1.0,
+        "no {} sample: {:?}",
+        sc::M_TTI_INTERACTIVE,
+        names(&after)
+    );
+}
+
+/// Exporting a PDF is the 294 ms main-thread stall `cargo xtask bench` measured and nobody could
+/// name. It must land in `task.duration` under `task.name=export.pdf`, so a slow frame can be
+/// attributed to the export that blocked it instead of to "the UI".
+#[test]
+fn a_pdf_export_is_timed_as_a_named_task() {
+    let _reading = reader();
+    let path = std::env::temp_dir().join(format!("deckcraft-otel-task-{}.pdf", std::process::id()));
+    let target = path.to_string_lossy().to_string();
+    let mut app = SlideApp::new(Session::with_new(), Services::default());
+    app.services.pick_save = Some(Box::new(move |_suggested: &str| Some(target.clone())));
+    let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+        |ui, app: &mut SlideApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        app,
+    );
+    harness.run_steps(2);
+
+    let before = points();
+    let export_before = total(&before, |point| point.metric == sc::M_TASK_DURATION && point.attr(sc::A_TASK_NAME) == Some("export.pdf"));
+    assert!(harness.state_mut().export_as("pdf", json!({})), "the export must be written to the picked path");
+    let after = points();
+
+    assert!(
+        total(&after, |point| point.metric == sc::M_TASK_DURATION && point.attr(sc::A_TASK_NAME) == Some("export.pdf")) > export_before,
+        "the export was not timed as a named task: {:?}",
+        names(&after)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A rejected request must not price an interaction. Opening the INP sample before the events are
+/// known to be valid leaves a pending interaction that the next frame happily "paints", recording a
+/// latency for a gesture that never happened — a fake sample in the exact tail the report reads.
+#[test]
+fn a_rejected_pointer_request_records_no_interaction() {
+    let _reading = reader();
+    let mut harness = harness();
+    harness.run_steps(2);
+
+    let (request, _reply) = crate::control::ControlRequest::new("ui.pointer", json!({"events": [{"kind": "wiggle", "x": 1.0, "y": 2.0}]}));
+    let ctx = harness.ctx.clone();
+    let outcome = crate::control::handle(harness.state_mut(), &ctx, &request);
+    let crate::control::Outcome::Done(reply) = outcome else { panic!("a dispatch result is a value") };
+    assert_eq!(reply.get("ok"), Some(&json!(false)), "an unknown pointer kind must be rejected: {reply}");
+    // The invariant is per app, not per histogram: shared instrumentation cannot attribute a
+    // sample to one test while the soak test is recording its own input in another thread.
+    assert!(harness.state_mut().interactions.is_empty(), "a rejected request must not leave a pending interaction for the next frame to paint");
+    harness.run_steps(2);
 }
 
 /// An unchanged slide must hit the texture cache, an edited one must miss *with a reason*, and

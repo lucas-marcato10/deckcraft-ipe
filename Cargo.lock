@@ -1077,6 +1077,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rfd",
  "serde_json",
+ "web-time",
  "winit",
  "winresource",
 ]

@@ -14,11 +14,11 @@ impl SlideApp {
     /// This is what makes INP work outside the control channel; the channel's `ui.pointer` is the
     /// synthetic route and reports its coalesced events separately.
     pub(super) fn observe_raw_input(&mut self, raw: &egui::RawInput) {
-        let Some(time) = raw.time else {
-            // No host timestamp: guessing one would put a fabricated number in the histogram.
-            return;
-        };
-        let at_ms = time * 1000.0;
+        // The app's own clock, not `raw.time`: egui's time is a different base, and mixing the two
+        // makes every phase negative (clamped to 0), which is a broken instrument that looks fine.
+        // The delay between the OS queueing the event and this hook is not observable from inside
+        // the app, so `input_delay` is honestly zero for native input.
+        let at_ms = crate::now_ms();
         let mut pressed = false;
         let mut moved_after_press = false;
         let mut key_pressed = false;

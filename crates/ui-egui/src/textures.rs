@@ -274,6 +274,9 @@ fn record_raster(ms: f64, megapixels: f64, index: usize, scale: f64, threads: u1
     attrs.push(KeyValue::new(sc::A_RENDER_THREADS, i64::from(threads)));
     attrs.push(KeyValue::new(sc::A_RENDER_SECOND_PASS, second_pass));
     instruments.raster_duration.record(ms, &attrs);
+    // The same elapsed time as a named main-thread task: a raster that crosses 50 ms is what makes
+    // a frame a long task, and the report must be able to name it.
+    crate::tasks::record_elapsed(sc::V_TASK_RASTER, ms);
     // One histogram, one `phase` attribute — never a second instrument per phase.
     attrs.push(KeyValue::new(sc::A_PHASE, sc::P_RASTER));
     instruments.frame_phase.record(ms, &attrs);

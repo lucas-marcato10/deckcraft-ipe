@@ -9,7 +9,9 @@ impl SlideApp {
             ctx.set_zoom_factor(scale);
         }
         if !self.styled {
+            let started = crate::now_ms();
             theme::install_fonts_with(ctx, &self.ui_fonts.faces);
+            crate::tasks::record(deckcraft_telemetry::sc::V_TASK_FONT_LOAD, started);
             self.styled = true;
             self.restyle = true;
             // Font definitions take effect at the next pass boundary. Do not paint a language

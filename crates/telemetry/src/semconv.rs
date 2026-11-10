@@ -140,11 +140,20 @@ pub const M_GPU_MEMORY_USED: &str = "deckcraft.gpu.memory.used";
 /// `request_repaint*` calls. Attribute: `repaint.source`.
 pub const M_REPAINT_REQUESTED: &str = "deckcraft.repaint.requested";
 /// Records the telemetry pipeline itself dropped. Non-zero invalidates the measurement.
+///
+/// **Not emitted today.** The SDK 0.33.1 batch processors expose no drop counter (they publish
+/// `otel.sdk.processor.span.processed`, `otel.sdk.processor.log.processed` and the log queue
+/// capacity instead), so a value here would be invented. The report proves the pipeline healthy by
+/// comparing the emitted span count to the painted-frame count, and reads the SDK's own
+/// `otel.sdk.*` series when it needs the processor's view.
 pub const M_DROPPED_RECORDS: &str = "deckcraft.telemetry.dropped_records";
 /// Cost of exporting telemetry, ms — feeds the overhead guard.
 pub const M_EXPORT_DURATION: &str = "deckcraft.telemetry.export.duration";
 /// Time to first frame, ms (FCP analogue).
 pub const M_TTF_FIRST_FRAME: &str = "deckcraft.startup.time_to_first_frame";
+/// Time from process start to the first accepted input, ms — the startup measure that says the
+/// window is not merely painted but actually responding.
+pub const M_TTI_INTERACTIVE: &str = "deckcraft.startup.time_to_interactive";
 /// Time to the first full canvas paint, ms (LCP analogue). Attribute: `content.type`.
 pub const M_LARGEST_PAINT: &str = "deckcraft.content.largest_paint";
 /// Resident set size, `By`.
@@ -183,6 +192,7 @@ pub const METRIC_NAMES: &[&str] = &[
     M_DROPPED_RECORDS,
     M_EXPORT_DURATION,
     M_TTF_FIRST_FRAME,
+    M_TTI_INTERACTIVE,
     M_LARGEST_PAINT,
     M_MEMORY_RSS,
     M_BINARY_SIZE,
@@ -348,6 +358,9 @@ pub const V_INTERACTION_TEXT: &str = "text";
 pub const V_INTERACTION_IME: &str = "ime";
 /// `task.name`: PDF export.
 pub const V_TASK_EXPORT_PDF: &str = "export.pdf";
+/// `task.name`: an export in a format other than PDF (the format is in the file extension and the
+/// `file.export` params; one bucket keeps the attribute cardinality bounded).
+pub const V_TASK_EXPORT: &str = "export";
 /// `task.name`: a raster pass.
 pub const V_TASK_RASTER: &str = "raster";
 /// `task.name`: font loading.
@@ -398,3 +411,12 @@ pub const E_CACHE_MISS: &str = "deckcraft.cache.miss";
 pub const E_TEARING_SUSPECT: &str = "deckcraft.tearing.suspect";
 /// Span event: a task exceeded [`LONG_TASK_MS`], with `task.name`.
 pub const E_LONG_TASK: &str = "deckcraft.long_task";
+/// `tearing.proxy` — which pacing symptom a frame showed. A proxy: it says a present was late,
+/// split or duplicated, never that the user saw a torn image.
+pub const A_TEARING_PROXY: &str = "tearing.proxy";
+/// `tearing.proxy`: the frame missed its vsync deadline.
+pub const V_TEARING_LATE: &str = "late";
+/// `tearing.proxy`: one present carried stale pixels.
+pub const V_TEARING_SPLIT: &str = "split";
+/// `tearing.proxy`: the same content was presented twice.
+pub const V_TEARING_DUPLICATE: &str = "duplicate";

@@ -35,6 +35,9 @@ egui = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
+# The clock `SlideApp::mark_process_start` takes: one instant, taken at the top of `main()`, so the
+# startup measures include everything before the app existed.
+web-time = { workspace = true }
 
 [build-dependencies]
 # Icon + VERSIONINFO for deckcraft.exe; build.rs only uses it when the target is Windows.

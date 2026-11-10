@@ -7,8 +7,8 @@ use super::updates_ui;
 use super::{
     AnimPreview, ControlRequest, FileTarget, HashMap, ImeCancelled, ImeComposition, ImeResetPhase, ImeTerminalPending, InputTarget, Mods,
     PendingFile, Perf, Receiver, Session, SlideApp, Target, UI_COMMANDS, UiRequest, Value, backstage, canvas, capture, dialogs, doc_window,
-    eyedropper, json, media, menus, notes, panes, preview, qat, repaint, ribbon, selpane, show, sorter, status, textures, theme, thumbs, toast,
-    uifonts,
+    eyedropper, json, media, menus, notes, otel_pacing, panes, preview, qat, repaint, ribbon, selpane, show, sorter, status, textures, theme, thumbs,
+    toast, uifonts,
 };
 use deckcraft_telemetry::sc;
 use opentelemetry::KeyValue;
@@ -70,6 +70,10 @@ impl SlideApp {
             perf: Perf { frame_ms: 0.0, render_ms: 0.0, fps: 0.0 },
             last_frame_ms: None,
             frame_id: 0,
+            display_interval_ms: otel_pacing::interval_ms(),
+            process_start: None,
+            startup_frame_sampled: false,
+            startup_input_sampled: false,
             interactions: Vec::new(),
             interaction_seq: 0,
             synthetic: vec![],
@@ -307,11 +311,14 @@ impl SlideApp {
         // One root span per painted frame; every phase below is a child of it, so a trace answers
         // "which part of this frame was slow" instead of requiring a timestamp correlation.
         let attrs = vec![KeyValue::new(sc::A_FRAME_ID, self.frame_id as i64), KeyValue::new(sc::A_FRAME_BUDGET_MS, sc::FRAME_BUDGET_MS)];
-        deckcraft_telemetry::spans::frame_span(attrs, |_cx| self.frame_body(ui));
-        // Exactly one close: every route through the body returns normally, so the frame's
-        // instruments are recorded once, including on the show-mode path that used to `return`
-        // early with its own `perf.frame_ms`.
-        self.finish_frame(t0);
+        // The closing work runs inside the span so the frame's own events (a tearing suspect) land
+        // on it. `frame_ms` is measured at the top of `finish_frame`, so the span duration stays the
+        // paint time the report uses as its exact per-frame sample; the recording that follows costs
+        // microseconds.
+        deckcraft_telemetry::spans::frame_span(attrs, |_cx| {
+            self.frame_body(ui);
+            self.finish_frame(t0);
+        });
     }
 
     /// Everything one painted frame does, inside its `deckcraft.frame` span.
@@ -420,18 +427,22 @@ impl SlideApp {
         self.perf.frame_ms = frame_ms;
         let instruments = deckcraft_telemetry::instruments();
         instruments.frame_duration.record(frame_ms, &[]);
-        // The interval between two frame starts; the first frame has no predecessor and records
-        // no delta rather than a fake zero.
-        if let Some(previous) = self.last_frame_ms {
-            instruments.frame_delta.record((t0 - previous).max(0.0), &[]);
+        // The interval between two frame starts — the same number the pacing verdict reads, so
+        // `frame.delta` and `pacing.error` can never disagree about it. The first frame has no
+        // predecessor and records no delta rather than a fake zero.
+        let delta = self.last_frame_ms.map(|previous| (t0 - previous).max(0.0));
+        if let Some(delta) = delta {
+            instruments.frame_delta.record(delta, &[]);
+            otel_pacing::record(&otel_pacing::pacing(self.display_interval_ms, delta, otel_pacing::present_mode()));
         }
         self.last_frame_ms = Some(t0);
-        if frame_ms > sc::FRAME_BUDGET_MS {
-            // Missed the 60 Hz budget. The finer classes (dropped frame, long task) need the
-            // presentation timestamps the pacing work owns; guessing one here would be worse than
-            // the coarse class that is certainly true.
-            instruments.frame_janky.add(1, &[KeyValue::new(sc::A_JANK_CLASS, sc::V_JANK_MISSED_VSYNC)]);
+        // One exclusive class per frame, by severity: the report adds the counters up to the number
+        // of janky frames, so a 60 ms frame must not also count as a dropped frame.
+        if let Some(class) = otel_pacing::jank_class(frame_ms) {
+            instruments.frame_janky.add(1, &[KeyValue::new(sc::A_JANK_CLASS, class)]);
         }
+        // Startup is a load measure, not a per-frame one: only the first painted frame samples it.
+        self.startup_first_frame();
         // This frame painted whatever input it consumed, so it is the frame that closes those
         // interactions. Do it after the frame's own instruments: the INP total ends at frame close
         // (the backend reports no presentation callback), and the frame's cost is not part of it.

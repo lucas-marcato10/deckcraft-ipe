@@ -16,6 +16,14 @@
 //!   callback, so this ends at [`SlideApp::finish_frame`] — *before* the compositor shows the
 //!   pixels. The total is therefore a lower bound on the optical latency; it does not prove what
 //!   the user saw, and it cannot see a frame the compositor dropped.
+//!
+//! # What is not covered
+//!
+//! A request that is rejected *before* it is dispatched is refused without opening an interaction
+//! (the control arms validate first). A dispatch that fails *after* the interaction opened — a
+//! command error inside `Session::pointer` or `Session::key` — was already counted, and the next
+//! painted frame closes it: the sample says "the app took this long to answer", which for a failed
+//! request is the time the user also waited.
 
 use deckcraft_telemetry::sc;
 use opentelemetry::KeyValue;
@@ -42,6 +50,8 @@ impl SlideApp {
     /// and real input; `coalesced_events` is recorded by the caller that batched several events
     /// into one paint.
     pub(crate) fn interaction_begin(&mut self, kind: &'static str, at_ms: f64) -> String {
+        // The first accepted input is what makes the app interactive, whatever route it came by.
+        self.startup_first_input();
         self.interaction_seq = self.interaction_seq.wrapping_add(1);
         let key = format!("{kind}:{}", self.interaction_seq);
         deckcraft_telemetry::spans::interaction_begin(&key, kind, at_ms);

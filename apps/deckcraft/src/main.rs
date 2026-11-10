@@ -20,6 +20,8 @@ mod audio;
 mod control_server;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod display;
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu_metrics;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
 mod logging;
@@ -36,6 +38,9 @@ struct App(
     /// OTel providers, present only when `DECKCRAFT_OTEL` was set at launch. Kept here so they
     /// outlive every frame and are flushed on the way out.
     Option<telemetry_setup::Providers>,
+    /// `nvidia-smi` gauges when `DECKCRAFT_GPU_METRICS=1`: stopped *before* the providers shut down,
+    /// so a late sample cannot record into a closed pipeline.
+    Option<gpu_metrics::Sampler>,
     /// Files opened from Finder and quit requests (see `apple_events`).
     #[cfg(target_os = "macos")]
     fmv_macos_events::Inbox,
@@ -56,6 +61,10 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         save_prefs(&self.0);
+        // The sampler records into the providers: stop it while they are still alive.
+        if let Some(mut gpu) = self.2.take() {
+            gpu.stop();
+        }
         // Flush and stop the SDK here, while the process is still healthy: on macOS the exit below
         // ends it immediately, so anything after that line never runs.
         if let Some(providers) = self.1.take() {
@@ -210,6 +219,9 @@ fn app_icon() -> Option<egui::IconData> {
 /// Install logging, parse startup arguments and environment, launch the native app, and
 /// propagate an eframe startup failure.
 fn main() -> eframe::Result {
+    // Before anything else: the startup measures are from here, so the window server, the driver
+    // and argument parsing are all part of what the user waited for.
+    let process_start = web_time::Instant::now();
     // First, so every start-up record (and the engine's panic hook, installed with the first
     // Session) is captured; see `logging`.
     let logger = logging::install();
@@ -301,6 +313,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             deckcraft_ui_egui::install_ime_pass_hooks(&cc.egui_ctx);
             let mut app = SlideApp::new(Session::new(), services(native_wayland));
+            app.mark_process_start(process_start);
             // Presenter View asks winit how many displays there are when a show starts.
             #[cfg(all(unix, not(target_os = "macos")))]
             if let Some(window) = cc.winit_window().cloned() {
@@ -332,9 +345,13 @@ fn main() -> eframe::Result {
             if show {
                 app.start_show(0, false);
             }
+            // After the providers exist: the sampler writes into them, so starting it earlier would
+            // only spawn `nvidia-smi` to record into no-op handles.
+            let gpu = providers.as_ref().and_then(|_| gpu_metrics::start());
             Ok(Box::new(App(
                 app,
                 providers,
+                gpu,
                 #[cfg(target_os = "macos")]
                 apple_events.connect(&cc.egui_ctx),
             )))
@@ -353,6 +370,7 @@ mod tests {
         if std::env::var_os("DECKCRAFT_TEST_ON_EXIT").is_some() {
             let mut app = App(
                 SlideApp::new(Session::new(), Services::default()),
+                None,
                 None,
                 #[cfg(target_os = "macos")]
                 fmv_macos_events::Inbox::default(),

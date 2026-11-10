@@ -52,10 +52,13 @@ mod app;
 mod clock;
 mod ime_hooks;
 mod inp;
+mod otel_pacing;
 pub mod panels;
 mod repaint;
 mod services;
+mod startup;
 mod state;
+mod tasks;
 
 pub use app::key_name;
 #[cfg(test)]
@@ -253,6 +256,16 @@ pub struct SlideApp {
     last_frame_ms: Option<f64>,
     /// Painted frames so far: the `frame.id` span attribute that ties a trace to a log line.
     frame_id: u64,
+    /// The display interval the pacing verdict compares against, ms. From
+    /// `DECKCRAFT_DISPLAY_REFRESH_HZ` (60 Hz when unset); a field instead of a constant so a test
+    /// can force a verdict without touching process-wide environment.
+    display_interval_ms: f64,
+    /// The instant `main()` took, when the host reported one: the base of the startup measures.
+    /// `None` means no sample is recorded rather than a fabricated one.
+    process_start: Option<web_time::Instant>,
+    /// Once-per-process guards for `startup.time_to_first_frame` and `time_to_interactive`.
+    startup_frame_sampled: bool,
+    startup_input_sampled: bool,
     /// Interactions (control channel or real input) waiting for the frame that paints them, and
     /// their monotonic key counter. See [`inp`].
     interactions: Vec<inp::PendingInteraction>,
