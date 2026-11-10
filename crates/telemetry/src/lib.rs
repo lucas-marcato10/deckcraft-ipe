@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 pub mod instruments;
 pub mod semconv;
+pub mod spans;
 
 /// Short alias for [`semconv`] — every call site writes `sc::M_FRAME_DURATION`.
 pub use semconv as sc;
