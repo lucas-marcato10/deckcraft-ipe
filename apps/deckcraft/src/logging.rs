@@ -225,16 +225,32 @@ impl Sink {
     }
 }
 
+/// A second consumer of every record this logger accepts: the OpenTelemetry log bridge.
+///
+/// The `log` crate allows one global logger per process and [`install`] already owns it, so the
+/// bridge cannot be installed with `log::set_boxed_logger`. It is attached here instead, after the
+/// filter has accepted a record, so OTel sees exactly what the stderr/file sinks see.
+pub trait Tee: Send + Sync {
+    fn log(&self, record: &log::Record<'_>);
+}
+
 /// The installed logger: a [`Filter`], standard error and a [`Sink`].
 pub struct AppLogger {
     filter: Filter,
     stderr: bool,
     sink: Mutex<Sink>,
+    /// Attached once, by the app boundary, when telemetry is enabled; never removed.
+    tee: OnceLock<Box<dyn Tee>>,
 }
 
 impl AppLogger {
     pub fn new(filter: Filter, stderr: bool) -> AppLogger {
-        AppLogger { filter, stderr, sink: Mutex::new(Sink::new(MAX_FILE_BYTES)) }
+        AppLogger { filter, stderr, sink: Mutex::new(Sink::new(MAX_FILE_BYTES)), tee: OnceLock::new() }
+    }
+
+    /// Forward every accepted record to `tee` as well. Idempotent: the first attachment wins.
+    pub fn attach_tee(&self, tee: Box<dyn Tee>) {
+        let _ = self.tee.set(tee);
     }
 
     /// Rotate the logs in `dir` and send records to the fresh file; returns its path.
@@ -275,6 +291,10 @@ impl log::Log for AppLogger {
             let _ = std::io::stderr().write_all(line.as_bytes());
         }
         self.sink.lock().unwrap_or_else(PoisonError::into_inner).write(&line);
+        // Last, so a slow exporter can never delay the sinks above.
+        if let Some(tee) = self.tee.get() {
+            tee.log(record);
+        }
     }
 
     fn flush(&self) {}
@@ -580,5 +600,28 @@ mod tests {
         record(&logger, log::Level::Info, "deckcraft", "after the panic");
         assert!(read(&path).contains("after the panic"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `log` crate allows one global logger per process and this module already owns it, so
+    /// the OTel bridge is attached as a second consumer instead of being installed globally. The
+    /// tee must see exactly the records the filter accepted, and must not decide levels itself.
+    #[test]
+    fn every_accepted_record_reaches_the_attached_tee() {
+        use std::sync::{Arc, Mutex};
+
+        struct Collected(Arc<Mutex<Vec<String>>>);
+        impl Tee for Collected {
+            fn log(&self, record: &log::Record<'_>) {
+                self.0.lock().unwrap_or_else(PoisonError::into_inner).push(format!("{} {}", record.level(), record.args()));
+            }
+        }
+
+        let logger = AppLogger::new(Filter::parse("info"), false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        logger.attach_tee(Box::new(Collected(Arc::clone(&seen))));
+
+        record(&logger, log::Level::Info, "deckcraft", "hello");
+        record(&logger, log::Level::Trace, "deckcraft", "filtered out");
+        assert_eq!(*seen.lock().unwrap_or_else(PoisonError::into_inner), ["INFO hello"]);
     }
 }

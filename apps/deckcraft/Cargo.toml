@@ -14,6 +14,20 @@ workspace = true
 deckcraft-engine = { workspace = true }
 deckcraft-ui-egui = { workspace = true }
 deckcraft-media = { workspace = true }
+# Telemetry is wired **only** at this boundary: L0 (`crates/telemetry`) carries the OTel API
+# alone, the SDK and the exporters live here. `opentelemetry-otlp`'s default features include
+# `reqwest-blocking-client`, which is what lets `PeriodicReader`/`BatchSpanProcessor` export from
+# their own threads with **no Tokio runtime**; the async clients are the optional ones.
+deckcraft-telemetry = { workspace = true }
+opentelemetry = { version = "=0.33.1", features = ["metrics", "trace", "logs"] }
+# No `testing` here: `InMemoryMetricExporter` is a dev-dependency feature (see the bottom of this
+# file), so the shipped binary does not pull `tokio/sync` in through the SDK's test helpers.
+opentelemetry_sdk = { version = "=0.33.1", features = ["metrics", "trace", "logs"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = true, features = ["metrics", "trace", "logs"] }
+opentelemetry-appender-log = "=0.33.1"
+# OTLP message types plus the SDK→proto transforms the file exporter serialises. No `gen-tonic`
+# (that is what drags in tonic); `with-serde` produces the OTLP/JSON encoding of the spec.
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "with-serde", "trace", "metrics", "logs"] }
 # `clipboard` is the OS clipboard (Ctrl+C/X/V with other apps). Without it egui simulates one inside
 # the app; the egui 0.37 migration (#1350) dropped it from this list.
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "clipboard", "links", "wayland", "x11"] }
@@ -42,3 +56,9 @@ fmv-macos-events = "=0.1.0"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11"] }
+
+[dev-dependencies]
+# `testing` adds `InMemoryMetricExporter`, the only way to read back what the meter provider
+# actually recorded. Kept out of `[dependencies]` so `tokio/sync` (which the feature enables
+# inside the SDK) never reaches the shipped binary.
+opentelemetry_sdk = { version = "=0.33.1", features = ["testing"] }

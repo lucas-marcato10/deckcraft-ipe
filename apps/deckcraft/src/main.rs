@@ -25,12 +25,17 @@ mod graphics;
 mod logging;
 #[cfg(not(target_arch = "wasm32"))]
 mod pasteboard;
+mod telemetry_file_exporter;
+mod telemetry_setup;
 
 use deckcraft_engine::Session;
 use deckcraft_ui_egui::{Services, SlideApp};
 
 struct App(
     SlideApp,
+    /// OTel providers, present only when `DECKCRAFT_OTEL` was set at launch. Kept here so they
+    /// outlive every frame and are flushed on the way out.
+    Option<telemetry_setup::Providers>,
     /// Files opened from Finder and quit requests (see `apple_events`).
     #[cfg(target_os = "macos")]
     fmv_macos_events::Inbox,
@@ -51,6 +56,11 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         save_prefs(&self.0);
+        // Flush and stop the SDK here, while the process is still healthy: on macOS the exit below
+        // ends it immediately, so anything after that line never runs.
+        if let Some(providers) = self.1.take() {
+            providers.shutdown();
+        }
         // macOS (#279): end the process here, before eframe tears the window down. AccessKit's
         // macOS adapter subclasses the window's content view and restores its class on teardown;
         // AppKit's Touch Bar support observes that view (KVO), so in the next display cycle
@@ -235,6 +245,9 @@ fn main() -> eframe::Result {
             }
         }
     }
+    // Telemetry is off unless asked for: `init` installs the global meter/tracer providers, so it
+    // must run before the first frame and after the logger exists (the log bridge is a tee on it).
+    let providers = if std::env::var_os("DECKCRAFT_OTEL").is_some() { telemetry_setup::init(logger) } else { None };
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeckCraft")
@@ -321,6 +334,7 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(App(
                 app,
+                providers,
                 #[cfg(target_os = "macos")]
                 apple_events.connect(&cc.egui_ctx),
             )))
@@ -339,6 +353,7 @@ mod tests {
         if std::env::var_os("DECKCRAFT_TEST_ON_EXIT").is_some() {
             let mut app = App(
                 SlideApp::new(Session::new(), Services::default()),
+                None,
                 #[cfg(target_os = "macos")]
                 fmv_macos_events::Inbox::default(),
             );
