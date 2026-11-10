@@ -7,6 +7,7 @@ mod assets;
 mod bench;
 mod ico;
 mod layers;
+mod otel_report;
 mod parity;
 mod pdf_deps;
 mod stats;
@@ -30,6 +31,8 @@ commands:
   bench [--save] [DECK...]
                   time open, render, save and export of the sample (and DECKs) in release, and
                   compare with docs/benchmarks/baseline.json (--save writes it)
+  otel-report <dir> [--baseline <dir>]
+                  aggregate official OTLP JSON Lines: p50/p90/p99/worst, jank, INP, bottleneck, A/B
   parity          recompute the PowerPoint feature-parity summary in docs/parity-checklist.md
   ico <out.ico> <in.png>...
                   pack square PNGs (<= 256 px) into a Windows .ico (see packaging/icons.sh)
@@ -48,6 +51,7 @@ fn main() -> ExitCode {
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("parity") => parity::run(&root()),
         Some("bench") => bench::run(&root(), &rest),
+        Some("otel-report") => otel_report::run(&root(), &rest),
         Some("ico") => ico::run(&rest),
         Some("version") => version::run(&root(), &rest),
         Some("-h" | "--help" | "help") | None => {
