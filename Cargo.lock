@@ -1330,6 +1330,7 @@ version = "0.15.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
 ]
 
 [[package]]
@@ -1367,6 +1368,7 @@ dependencies = [
  "egui_kittest",
  "log",
  "opentelemetry",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "serde",
  "serde_json",

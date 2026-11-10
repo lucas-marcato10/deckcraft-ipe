@@ -11,3 +11,8 @@ workspace = true
 [dependencies]
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-semantic-conventions = "=0.33.1"
+
+[dev-dependencies]
+# The overhead guard needs a real SDK meter to compare against the no-op provider. Test-only:
+# the crate itself stays API-only and wasm-safe.
+opentelemetry_sdk = { version = "=0.33.1", features = ["testing"] }

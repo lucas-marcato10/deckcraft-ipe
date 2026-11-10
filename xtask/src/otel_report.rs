@@ -210,7 +210,6 @@ struct Run {
     spans: Vec<Span>,
     metrics: Vec<MetricPoint>,
     resource: Attributes,
-    logs: usize,
     log_errors: usize,
     notes: Vec<String>,
 }
@@ -418,7 +417,6 @@ impl Run {
                 let Some(records) = scope_log.get("logRecords").and_then(Value::as_array) else {
                     continue;
                 };
-                self.logs += records.len();
                 for record in records {
                     if record.get("severityNumber").and_then(parse_u64).unwrap_or(0) >= 17 {
                         self.log_errors += 1;
@@ -737,6 +735,7 @@ struct Pacing {
 struct Health {
     dropped_records: u64,
     export_p99: Option<f64>,
+    log_errors: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1014,7 +1013,7 @@ fn health(run: &Run, frame_spans: usize) -> Health {
     let dropped_records = painted.saturating_sub(frame_spans as u64);
     let export_p99 =
         hist_totals(run, sc::M_EXPORT_DURATION).and_then(|(count, _, buckets, bounds)| histogram_quantile(&bounds, &buckets, count, 0.99));
-    Health { dropped_records, export_p99 }
+    Health { dropped_records, export_p99, log_errors: run.log_errors }
 }
 
 fn idle_repaint_rate(run: &Run, frames: &[&Span]) -> Option<f64> {
@@ -1147,11 +1146,20 @@ fn print_report(candidate: &Summary, baseline: Option<&Summary>, run: &Run) -> R
         candidate.pacing.split,
         format_ms(candidate.pacing.error_p99)
     );
-    println!("telemetry health: dropped_records={}  export_p99={}", candidate.health.dropped_records, format_ms(candidate.health.export_p99));
+    println!(
+        "telemetry health: dropped_records={}  export_p99={}{}",
+        candidate.health.dropped_records,
+        format_ms(candidate.health.export_p99),
+        if candidate.health.log_errors > 0 { format!("  log_errors={}", candidate.health.log_errors) } else { String::new() }
+    );
 
     let Some(baseline) = baseline else {
-        return finish_gates(candidate, None);
+        return finish_gates(candidate, None, "PASS: no baseline, gates not applied");
     };
+    if candidate.stats.is_none() || baseline.stats.is_none() {
+        println!("A/B (candidate/baseline): n/a (no frames in candidate or baseline)");
+        return finish_gates(candidate, None, "PASS: no comparable baseline");
+    }
     let p50 = ratio(stats.map(|stats| stats.p50), baseline.stats.map(|stats| stats.p50));
     let p99 = ratio(stats.map(|stats| stats.p99), baseline.stats.map(|stats| stats.p99));
     let inp_ratio = ratio(candidate.inp.total.map(|stats| stats.p99), baseline.inp.total.map(|stats| stats.p99));
@@ -1163,10 +1171,10 @@ fn print_report(candidate: &Summary, baseline: Option<&Summary>, run: &Run) -> R
         format_ratio(inp_ratio),
         format_ratio(renders)
     );
-    finish_gates(candidate, Some((p50, p99)))
+    finish_gates(candidate, Some((p50, p99)), "PASS: p99 within gate (<=1.10x), median within gate (<=1.05x)")
 }
 
-fn finish_gates(candidate: &Summary, comparison: Option<(Option<f64>, Option<f64>)>) -> Result<(), String> {
+fn finish_gates(candidate: &Summary, comparison: Option<(Option<f64>, Option<f64>)>, pass_message: &str) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
     if candidate.health.dropped_records > 0 {
         failures.push(format!("dropped_records={} (the telemetry pipeline lost records; the run is invalid)", candidate.health.dropped_records));
@@ -1190,11 +1198,7 @@ fn finish_gates(candidate: &Summary, comparison: Option<(Option<f64>, Option<f64
         }
     }
     if failures.is_empty() {
-        if comparison.is_some() {
-            println!("PASS: p99 within gate (<=1.10x), median within gate (<=1.05x)");
-        } else {
-            println!("PASS: no baseline, gates not applied");
-        }
+        println!("{pass_message}");
         return Ok(());
     }
     for failure in &failures {
@@ -1252,11 +1256,17 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
             for note in &baseline_run.notes {
                 eprintln!("note: {note}");
             }
-            if let Some(mismatch) = resource_mismatch(&run, &baseline_run) {
+            let baseline_summary = Summary::build(&baseline_run);
+            // A run with no frames has no resource identity to compare; the report says "no
+            // comparable baseline" instead of pretending the missing adapter is a mismatch.
+            if candidate.frames > 0
+                && baseline_summary.frames > 0
+                && let Some(mismatch) = resource_mismatch(&run, &baseline_run)
+            {
                 println!("REFUSED: resource mismatch ({mismatch})");
                 return Err("refusing to compare runs from different environments".into());
             }
-            Some(Summary::build(&baseline_run))
+            Some(baseline_summary)
         }
         None => None,
     };

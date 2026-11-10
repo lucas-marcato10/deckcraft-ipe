@@ -151,6 +151,28 @@ fn five_frame_spans_yield_nearest_rank_percentiles_and_one_jank_episode() {
     assert!(stdout.contains("longest_run=2"), "the episode is two frames long:\n{stdout}");
 }
 
+/// A log record is not a frame, but an ERROR in the run is a signal the health line must carry:
+/// the report reads `logs.jsonl` rather than silently ignoring the third signal.
+#[test]
+fn error_logs_are_reported_in_the_health_line() {
+    let dir = temp_dir("logs");
+    let resource = resource(&[("test.variant", "candidate")]);
+    let line = json!({
+        "resourceLogs": [{
+            "resource": resource,
+            "scopeLogs": [{"scope": {"name": "deckcraft"}, "logRecords": [
+                {"timeUnixNano": "1000000000", "severityNumber": 17, "severityText": "ERROR", "body": {"stringValue": "export failed"}},
+                {"timeUnixNano": "1000000001", "severityNumber": 9, "severityText": "INFO", "body": {"stringValue": "started"}}
+            ]}]
+        }]
+    })
+    .to_string();
+    write_lines(&dir.join("logs.jsonl"), &[line]);
+    let (code, stdout, stderr) = report(&[dir.to_str().expect("utf-8 temp path")]);
+    assert_eq!(code, Some(0), "logs-only is a valid (empty) run\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("log_errors=1"), "one ERROR record must be counted, the INFO must not:\n{stdout}");
+}
+
 /// An empty directory is not an error: it is the honest report of a run where telemetry was on
 /// and nothing was recorded. `frames: 0`, exit 0.
 #[test]
@@ -275,6 +297,22 @@ fn different_gpu_adapters_are_refused_as_an_ab_baseline() {
         stdout.contains("REFUSED: resource mismatch (hw.gpu.adapter: candidate=NVIDIA GeForce MX450 baseline=llvmpipe)"),
         "the refusal names the attribute and both values:\n{stdout}"
     );
+}
+
+/// An empty baseline is not a gate pass: there is nothing to compare, and saying "p99 within
+/// gate" would turn a missing run into a green light. The health gates still apply to the
+/// candidate.
+#[test]
+fn an_empty_baseline_is_not_reported_as_a_gate_pass() {
+    let candidate = temp_dir("ab-candidate-empty-baseline");
+    let baseline = temp_dir("ab-baseline-empty");
+    write_run(&candidate, "candidate", "llvmpipe", &[3.0, 3.0, 3.0, 3.0, 3.0]);
+
+    let (code, stdout, stderr) = report(&[candidate.to_str().expect("utf-8 path"), "--baseline", baseline.to_str().expect("utf-8 path")]);
+    assert_eq!(code, Some(0), "nothing to compare is not a failure\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("A/B (candidate/baseline): n/a (no frames in candidate or baseline)"), "the report says why:\n{stdout}");
+    assert!(stdout.contains("PASS: no comparable baseline"), "the pass line names the missing baseline:\n{stdout}");
+    assert!(!stdout.contains("PASS: p99 within gate"), "an empty baseline must not claim the gates passed:\n{stdout}");
 }
 
 /// A malformed line is a failed measurement, not a number to skip: the report names the file and

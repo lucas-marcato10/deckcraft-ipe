@@ -41,6 +41,9 @@ egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 # `testing` adds `InMemoryMetricExporter`: the only way to read back what the meter provider
 # actually recorded. A dev-dependency, so the shipped binary never links the SDK test helpers.
 opentelemetry_sdk = { version = "=0.33.1", features = ["testing"] }
+# The A/B harness serialises the in-memory batches as official OTLP JSON Lines, using the same
+# proto transforms the app's file exporters use. Test-only: the app owns the production exporter.
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "with-serde", "trace", "metrics"] }
 
 [build-dependencies]
 serde_json = { workspace = true }
