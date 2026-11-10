@@ -80,11 +80,7 @@ pub fn nearby(dragged: &BoxEntry, others: &[BoxEntry], container: &BoxEntry) -> 
     let hi = container.max[0].max(dragged.max[0]);
     let ylo = dragged.min[1] - PROXIMITY_Y;
     let yhi = dragged.max[1] + PROXIMITY_Y;
-    others
-        .iter()
-        .filter(|b| b.id != dragged.id && b.max[0] >= lo && b.min[0] <= hi && b.max[1] >= ylo && b.min[1] <= yhi)
-        .copied()
-        .collect()
+    others.iter().filter(|b| b.id != dragged.id && b.max[0] >= lo && b.min[0] <= hi && b.max[1] >= ylo && b.min[1] <= yhi).copied().collect()
 }
 
 /// The spacing decision for a horizontal move: the snap offset and the measurements to label.
