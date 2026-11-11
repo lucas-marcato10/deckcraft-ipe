@@ -555,6 +555,8 @@ fn gauge_last(run: &Run, name: &str) -> Option<f64> {
 
 /// Standard histogram quantile: linear interpolation inside the bucket that contains the rank.
 /// Unlike a span-derived percentile this is an **estimate**; the report says so in the runbook.
+/// The final bucket is `(+last_bound, +Inf)`: a rank that lands there is larger than anything we
+/// can interpolate, so the honest answer is `None` (`n/a`), never the last explicit bound.
 fn histogram_quantile(bounds: &[f64], buckets: &[u64], count: u64, quantile: f64) -> Option<f64> {
     if count == 0 || buckets.is_empty() {
         return None;
@@ -567,15 +569,19 @@ fn histogram_quantile(bounds: &[f64], buckets: &[u64], count: u64, quantile: f64
         if (cumulative as f64) < rank {
             continue;
         }
-        let lower = if index == 0 { 0.0 } else { *bounds.get(index - 1).unwrap_or(&0.0) };
-        let upper = bounds.get(index).copied().unwrap_or(lower);
+        // index == bounds.len() is the +Inf bucket.
+        if index >= bounds.len() {
+            return None;
+        }
+        let lower = if index == 0 { 0.0 } else { bounds[index - 1] };
+        let upper = bounds[index];
         if *bucket == 0 {
             return Some(lower);
         }
         let fraction = ((rank - previous as f64) / *bucket as f64).clamp(0.0, 1.0);
         return Some(lower + (upper - lower) * fraction);
     }
-    bounds.last().copied()
+    None
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1271,4 +1277,27 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
         None => None,
     };
     print_report(&candidate, baseline.as_ref(), &run)
+}
+
+#[cfg(test)]
+mod quantile_tests {
+    use super::histogram_quantile;
+
+    #[test]
+    fn an_overflow_bucket_is_not_reported_as_the_last_explicit_bound() {
+        let bounds = [4.0, 8.0, 16.7, 1000.0];
+        // 9 samples inside the bounds, 1 in the (+1000, +Inf) bucket.
+        let buckets = [1_u64, 2, 3, 3, 1];
+        let p50 = histogram_quantile(&bounds, &buckets, 10, 0.50).expect("p50 inside bounds");
+        assert!((p50 - 13.8).abs() < 0.2, "p50 interpolado: {p50}");
+        assert_eq!(histogram_quantile(&bounds, &buckets, 10, 0.99), None, "p99 cai no +Inf");
+    }
+
+    #[test]
+    fn a_normal_bucket_still_interpolates() {
+        let bounds = [4.0, 8.0, 16.7];
+        let buckets = [1_u64, 2, 3, 0];
+        assert!(histogram_quantile(&bounds, &buckets, 6, 0.50).is_some());
+        assert_eq!(histogram_quantile(&bounds, &buckets, 0, 0.50), None);
+    }
 }
