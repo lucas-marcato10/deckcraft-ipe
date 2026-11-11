@@ -1,7 +1,7 @@
 # DeckCraft telemetry semantic conventions
 
 **Status:** current · **OpenTelemetry API/SDK:** `=0.33.1` · **Semantic conventions:** 1.42.0
-(the version `opentelemetry-semantic-conventions` 0.33.1 pins) · **Updated:** 2026-11-10
+(the version `opentelemetry-semantic-conventions` 0.33.1 pins) · **Updated:** 2026-11-11
 
 This document mirrors [`crates/telemetry/src/semconv.rs`](../crates/telemetry/src/semconv.rs), which
 is the source of truth. `tests/semconv.rs` guards the constants; `xtask/src/otel_report.rs` reads
@@ -66,7 +66,7 @@ One histogram with a `phase` attribute beats one instrument per phase. Every nam
 | `deckcraft.slide.raster.pixels` | Histogram f64 | Mpx | `slide.index`, `render.scale` | yes |
 | `deckcraft.task.duration` | Histogram f64 | ms | `task.name` | yes |
 | `deckcraft.texture.cache` | Counter u64 | `1` | `cache.kind`, `cache.result`, `cache.reason` | yes |
-| `deckcraft.texture.cache.thrash` | Counter u64 | `1` | `slide.index` | yes |
+| `deckcraft.texture.cache.thrash` | Counter u64 | `1` | `slide.index` | yes; the exact same cache key missing twice within 250 ms, not a per-frame edit |
 | `deckcraft.texture.bytes` | Histogram f64 | By | `cache.kind`, `cache.result` | yes |
 | `deckcraft.gpu.frame.time` | Histogram f64 | ms | — | **no** — no wgpu timestamp queries in the egui fork; a wall-clock upload labelled GPU time would be fabricated |
 | `deckcraft.gpu.utilization` | Gauge f64 | `1` | — | only with `DECKCRAFT_GPU_METRICS=1` (nvidia-smi, 5 s cadence) |
@@ -170,4 +170,5 @@ whose raster/convert/upload phases exist only as instruments.
 
 | Date | Change |
 |---|---|
+| 2026-11-11 | `deckcraft.texture.cache.thrash` defined on the whole cache key (document `Arc`, zoom, region, animation), not the slide index: a drag that edits every frame no longer counts as thrash. |
 | 2026-11-10 | Initial conventions for the OTel 0.33.1 instrumentation: 30 instruments, 8 frame phases, frame/interaction/startup spans, the three diagnostic events. |

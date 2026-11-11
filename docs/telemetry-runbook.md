@@ -1,6 +1,6 @@
 # DeckCraft telemetry runbook
 
-**Updated:** 2026-11-10 · **Pipeline:** OpenTelemetry 0.33.1, SDK at the app boundary, API-only in
+**Updated:** 2026-11-11 · **Pipeline:** OpenTelemetry 0.33.1, SDK at the app boundary, API-only in
 the libraries.
 
 Telemetry is **off by default**. Every instrument is a no-op until the application installs a
@@ -74,7 +74,7 @@ signal, not an error; an empty directory prints `frames: 0` and exits 0.
 DeckCraft OTLP report   service=deckcraft 0.15.0  variant=candidate  run=otel-ab-1000
 frames: 1021   p50=11.70ms p90=14.18ms p99=16.91ms worst=25.04ms  1%low_fps=53.6  CV=0.149
 jank:   missed_vsync=14 dropped_frame=0 long_task=0  jank=14 longest_run=1
-cache:  hit=18 miss=1003  hit_rate=1.8%  renders/interaction=1.00  thrash=1002
+cache:  hit=18 miss=1003  hit_rate=1.8%  renders/interaction=1.00  thrash=0
 INP (drag): p50=11.78ms p90=14.23ms p99=16.97ms worst=19.42ms
   input_delay=0.01ms  processing=0.03ms  presentation=11.74ms  coalesced=0
 bottleneck (p99 by phase):        cpu/wall
@@ -95,8 +95,11 @@ How to read it:
 - **`jank`** counts frames by exclusive class; `jank=` is the number of **jank episodes** (maximal
   consecutive runs over 16.7 ms) and `longest_run` is the longest such run.
 - **`cache`** is the texture cache counter; `renders/interaction` is raster passes per interaction.
-  A drag that edits every frame is expected to thrash the canvas cache — `thrash` is a signal, not
-  automatically a bug.
+  `thrash` counts the **exact same cache key** missing twice within 250 ms — the cache dropping a
+  texture it just built. A drag that edits every frame is a new document per frame (a new `Arc`,
+  so a new key) and is a legitimate re-render: it raises `miss`, never `thrash`. A non-zero
+  `thrash` points at a cache that does not hold its own result (or at `invalidate()` between two
+  identical requests), not at the edit rate.
 - **`INP`** is the interaction span's `inp.total_ms`; the phase breakdown is the p50 of each
   `inp.*` attribute. `coalesced` must be 0 for a per-frame price.
 - **`bottleneck`** is the `frame.phase.duration` histogram, p99 by `phase`. Raster/convert/upload
