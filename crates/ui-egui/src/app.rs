@@ -422,7 +422,7 @@ impl SlideApp {
 
     /// Close a painted frame: `Perf` (unchanged, for `ui.inspect` and `xtask bench`) plus the
     /// frame's OpenTelemetry instruments.
-    fn finish_frame(&mut self, t0: f64) {
+    pub(crate) fn finish_frame(&mut self, t0: f64) {
         let frame_ms = (now_ms() - t0).max(0.0);
         self.perf.frame_ms = frame_ms;
         let instruments = deckcraft_telemetry::instruments();
@@ -433,7 +433,12 @@ impl SlideApp {
         let delta = self.last_frame_ms.map(|previous| (t0 - previous).max(0.0));
         if let Some(delta) = delta {
             instruments.frame_delta.record(delta, &[]);
-            otel_pacing::record(&otel_pacing::pacing(self.display_interval_ms, delta, otel_pacing::present_mode()));
+            // Only an active frame can miss a vsync. A gap this large is the app being idle or
+            // throttled (no repaint was requested), not a present that arrived late — classifying
+            // it would push a ~1 s sample into the histogram's tail, where the p99 lives.
+            if otel_pacing::should_classify(self.display_interval_ms, delta) {
+                otel_pacing::record(&otel_pacing::pacing(self.display_interval_ms, delta, otel_pacing::present_mode()));
+            }
         }
         self.last_frame_ms = Some(t0);
         // One exclusive class per frame, by severity: the report adds the counters up to the number

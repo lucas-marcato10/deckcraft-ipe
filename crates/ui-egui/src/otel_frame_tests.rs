@@ -18,7 +18,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use deckcraft_engine::Session;
 use deckcraft_telemetry::sc;
 use opentelemetry::KeyValue;
-use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde_json::json;
 
@@ -67,6 +67,10 @@ struct Point {
     value: f64,
     /// The histogram's recorded values summed. Zero for counters, where `value` is the sum.
     sum: f64,
+    /// The histogram's cumulative per-bucket counts, including the `+Inf` bucket. Empty for sums
+    /// and gauges: this is what lets a test ask "did anything land in the tail?" without caring
+    /// what else in the process recorded.
+    buckets: Vec<u64>,
 }
 
 impl Point {
@@ -76,101 +80,157 @@ impl Point {
 }
 
 fn push<'a>(out: &mut Vec<Point>, metric: &str, attrs: impl Iterator<Item = &'a KeyValue>, value: f64) {
-    out.push(Point { metric: metric.to_owned(), attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(), value, sum: 0.0 });
+    out.push(Point {
+        metric: metric.to_owned(),
+        attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(),
+        value,
+        sum: 0.0,
+        buckets: Vec::new(),
+    });
 }
 
 /// A histogram data point: its sample count and the sum of the samples, so a test can tell "it
 /// recorded" from "it recorded a real number".
-fn push_hist<'a>(out: &mut Vec<Point>, metric: &str, attrs: impl Iterator<Item = &'a KeyValue>, count: f64, sum: f64) {
-    out.push(Point { metric: metric.to_owned(), attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(), value: count, sum });
+fn push_hist<'a>(out: &mut Vec<Point>, metric: &str, attrs: impl Iterator<Item = &'a KeyValue>, count: f64, sum: f64, buckets: Vec<u64>) {
+    out.push(Point {
+        metric: metric.to_owned(),
+        attrs: attrs.map(|kv| (kv.key.to_string(), kv.value.to_string())).collect(),
+        value: count,
+        sum,
+        buckets,
+    });
+}
+
+/// How many samples of a histogram data point are above `lower_ms`, from its cumulative bucket
+/// counts.
+///
+/// Bucket `index` covers `(bounds[index - 1], bounds[index]]` and the bucket past the last bound is
+/// `+Inf`, so everything not counted at or below `lower_ms` is the tail.
+fn samples_above(point: &Point, bounds: &[f64], lower_ms: f64) -> f64 {
+    let total: u64 = point.buckets.iter().sum();
+    let below: u64 = point
+        .buckets
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| bounds.get(*index).is_some_and(|upper| *upper <= lower_ms))
+        .map(|(_, count)| *count)
+        .sum();
+    total.saturating_sub(below) as f64
+}
+
+/// Samples of `deckcraft.pacing.error` in the histogram's tail — above 500 ms, where the report's
+/// p99 lives once an idle gap is classified as a late present.
+fn pacing_tail(points: &[Point]) -> f64 {
+    points.iter().filter(|point| point.metric == sc::M_PACING_ERROR).map(|point| samples_above(point, sc::FRAME_BOUNDS_MS, 500.0)).sum()
 }
 
 /// Every data point the in-memory exporter holds after a forced collection.
 ///
-/// Batches accumulate (the exporter never drains on read), so values only grow and a
-/// before/after difference is a sound "this recorded more" check even if another test shares the
-/// same process.
+/// Batches accumulate (the exporter never drains on read) and the reader's temporality is
+/// cumulative, so each batch repeats every sample recorded since the process started: this is a
+/// "recorded at all" view, never a before/after difference. [`latest`] answers the difference.
 fn points() -> Vec<Point> {
     let pipeline = pipeline();
     pipeline.provider.force_flush().unwrap();
     let batches = pipeline.exporter.get_finished_metrics().unwrap();
     let mut out = Vec::new();
     for batch in &batches {
-        for scope in batch.scope_metrics() {
-            for metric in scope.metrics() {
-                let name = metric.name();
-                match metric.data() {
-                    AggregatedMetrics::F64(data) => match data {
-                        MetricData::Histogram(hist) => {
-                            for point in hist.data_points() {
-                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum());
-                            }
+        collect(&mut out, batch);
+    }
+    out
+}
+
+/// The data points of the most recent collection only.
+///
+/// With cumulative temporality the newest batch carries the running total of every sample, so the
+/// difference between two `latest()` reads is the increment between them — the only sound way to
+/// assert that one instrument did *not* record while another one did.
+fn latest() -> Vec<Point> {
+    let pipeline = pipeline();
+    pipeline.provider.force_flush().unwrap();
+    let batches = pipeline.exporter.get_finished_metrics().unwrap();
+    let mut out = Vec::new();
+    if let Some(batch) = batches.last() {
+        collect(&mut out, batch);
+    }
+    out
+}
+
+/// Append one collection batch's data points to `out`.
+fn collect(out: &mut Vec<Point>, batch: &ResourceMetrics) {
+    for scope in batch.scope_metrics() {
+        for metric in scope.metrics() {
+            let name = metric.name();
+            match metric.data() {
+                AggregatedMetrics::F64(data) => match data {
+                    MetricData::Histogram(hist) => {
+                        for point in hist.data_points() {
+                            push_hist(out, name, point.attributes(), point.count() as f64, point.sum(), point.bucket_counts().collect());
                         }
-                        MetricData::Sum(sum) => {
-                            for point in sum.data_points() {
-                                push(&mut out, name, point.attributes(), point.value());
-                            }
+                    }
+                    MetricData::Sum(sum) => {
+                        for point in sum.data_points() {
+                            push(out, name, point.attributes(), point.value());
                         }
-                        MetricData::Gauge(gauge) => {
-                            for point in gauge.data_points() {
-                                push(&mut out, name, point.attributes(), point.value());
-                            }
+                    }
+                    MetricData::Gauge(gauge) => {
+                        for point in gauge.data_points() {
+                            push(out, name, point.attributes(), point.value());
                         }
-                        MetricData::ExponentialHistogram(hist) => {
-                            for point in hist.data_points() {
-                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum());
-                            }
+                    }
+                    MetricData::ExponentialHistogram(hist) => {
+                        for point in hist.data_points() {
+                            push_hist(out, name, point.attributes(), point.count() as f64, point.sum(), Vec::new());
                         }
-                    },
-                    AggregatedMetrics::U64(data) => match data {
-                        MetricData::Histogram(hist) => {
-                            for point in hist.data_points() {
-                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
-                            }
+                    }
+                },
+                AggregatedMetrics::U64(data) => match data {
+                    MetricData::Histogram(hist) => {
+                        for point in hist.data_points() {
+                            push_hist(out, name, point.attributes(), point.count() as f64, point.sum() as f64, point.bucket_counts().collect());
                         }
-                        MetricData::Sum(sum) => {
-                            for point in sum.data_points() {
-                                push(&mut out, name, point.attributes(), point.value() as f64);
-                            }
+                    }
+                    MetricData::Sum(sum) => {
+                        for point in sum.data_points() {
+                            push(out, name, point.attributes(), point.value() as f64);
                         }
-                        MetricData::Gauge(gauge) => {
-                            for point in gauge.data_points() {
-                                push(&mut out, name, point.attributes(), point.value() as f64);
-                            }
+                    }
+                    MetricData::Gauge(gauge) => {
+                        for point in gauge.data_points() {
+                            push(out, name, point.attributes(), point.value() as f64);
                         }
-                        MetricData::ExponentialHistogram(hist) => {
-                            for point in hist.data_points() {
-                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
-                            }
+                    }
+                    MetricData::ExponentialHistogram(hist) => {
+                        for point in hist.data_points() {
+                            push_hist(out, name, point.attributes(), point.count() as f64, point.sum() as f64, Vec::new());
                         }
-                    },
-                    AggregatedMetrics::I64(data) => match data {
-                        MetricData::Histogram(hist) => {
-                            for point in hist.data_points() {
-                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
-                            }
+                    }
+                },
+                AggregatedMetrics::I64(data) => match data {
+                    MetricData::Histogram(hist) => {
+                        for point in hist.data_points() {
+                            push_hist(out, name, point.attributes(), point.count() as f64, point.sum() as f64, point.bucket_counts().collect());
                         }
-                        MetricData::Sum(sum) => {
-                            for point in sum.data_points() {
-                                push(&mut out, name, point.attributes(), point.value() as f64);
-                            }
+                    }
+                    MetricData::Sum(sum) => {
+                        for point in sum.data_points() {
+                            push(out, name, point.attributes(), point.value() as f64);
                         }
-                        MetricData::Gauge(gauge) => {
-                            for point in gauge.data_points() {
-                                push(&mut out, name, point.attributes(), point.value() as f64);
-                            }
+                    }
+                    MetricData::Gauge(gauge) => {
+                        for point in gauge.data_points() {
+                            push(out, name, point.attributes(), point.value() as f64);
                         }
-                        MetricData::ExponentialHistogram(hist) => {
-                            for point in hist.data_points() {
-                                push_hist(&mut out, name, point.attributes(), point.count() as f64, point.sum() as f64);
-                            }
+                    }
+                    MetricData::ExponentialHistogram(hist) => {
+                        for point in hist.data_points() {
+                            push_hist(out, name, point.attributes(), point.count() as f64, point.sum() as f64, Vec::new());
                         }
-                    },
-                }
+                    }
+                },
             }
         }
     }
-    out
 }
 
 /// The metric names the batch carries — the failure message of a missing metric.
@@ -296,21 +356,25 @@ fn a_pointer_gesture_through_the_control_channel_reports_inp_and_its_three_phase
 }
 
 /// A frame that misses its vsync must emit a pacing error and the `late` tearing proxy. The
-/// display interval is forced absurdly small so every harness frame is late: the verdict is
-/// arithmetic on real timestamps, so this exercises the emission, not a stub.
+/// predecessor is placed 34 ms back — two 60 Hz intervals — so this is a genuinely late frame, not
+/// the idle gap the classification ceiling refuses to judge.
 #[test]
 fn a_late_frame_emits_a_pacing_error_and_the_tearing_proxy() {
     let _reading = reader();
     let mut harness = harness();
     harness.run_steps(2);
-    // 0.01 ms per display interval: any real frame exceeds one and a half intervals.
-    harness.state_mut().display_interval_ms = 0.01;
+    let app = harness.state_mut();
+    app.display_interval_ms = 1000.0 / 60.0;
 
-    let before = points();
+    let before = latest();
     let error_before = total(&before, |point| point.metric == sc::M_PACING_ERROR);
     let late_before = total(&before, |point| point.metric == sc::M_FRAME_LATE);
-    harness.run_steps(3);
-    let after = points();
+    for _ in 0..3 {
+        let t0 = crate::now_ms();
+        app.last_frame_ms = Some(t0 - 34.0);
+        app.finish_frame(t0);
+    }
+    let after = latest();
 
     assert!(
         total(&after, |point| point.metric == sc::M_PACING_ERROR) - error_before >= 3.0,
@@ -320,6 +384,51 @@ fn a_late_frame_emits_a_pacing_error_and_the_tearing_proxy() {
     assert!(
         total(&after, |point| point.metric == sc::M_FRAME_LATE) - late_before >= 3.0,
         "three late frames must each count as late: {:?}",
+        names(&after)
+    );
+}
+
+/// An idle second between two frames is not a late present: no repaint was requested, so there was
+/// no vsync to miss. Classifying the gap would push a ~1 s sample into the pacing histogram's
+/// `+Inf` bucket and make the report print 1000,00 ms as a p99.
+///
+/// The control is `frame.delta`: the frame did close and did record its interval, so a zero
+/// pacing delta is the guard working, not the frame never happening.
+#[test]
+fn an_idle_second_between_frames_emits_no_pacing_verdict() {
+    let _reading = reader();
+    let mut harness = harness();
+    harness.run_steps(2);
+
+    let before = latest();
+    let tail_before = pacing_tail(&before);
+    let delta_before = total(&before, |point| point.metric == sc::M_FRAME_DELTA);
+
+    let app = harness.state_mut();
+    app.display_interval_ms = 1000.0 / 60.0;
+    let t0 = crate::now_ms();
+    // The previous frame started one second earlier: the app was asleep, nothing was presented late.
+    app.last_frame_ms = Some(t0 - 1000.0);
+    app.finish_frame(t0);
+
+    let after = latest();
+    let tail_after = pacing_tail(&after);
+    let delta_after = total(&after, |point| point.metric == sc::M_FRAME_DELTA);
+
+    // The process-global exporter also carries the frames other tests in this binary paint, so the
+    // assertion is on the histogram's tail (where a ~1 s gap lands and a real frame never does),
+    // not on a process-wide count. `frame.delta` proves this frame did close and record.
+    assert!(
+        delta_after - delta_before >= 1.0,
+        "the idle frame must still close and record its interval, or this test proves nothing: {:?}",
+        names(&after)
+    );
+    assert_eq!(
+        tail_after - tail_before,
+        0.0,
+        "an idle gap put {} sample(s) above 500 ms into {}: {:?}",
+        tail_after - tail_before,
+        sc::M_PACING_ERROR,
         names(&after)
     );
 }

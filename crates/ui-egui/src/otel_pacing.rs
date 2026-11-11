@@ -215,8 +215,8 @@ mod tests {
     }
 
     /// An interval of a second between two `ui()` passes is not a late present: the app was idle or
-    /// throttled and no repaint was requested. Classifying it as `late` poisons the p99 with the
-    /// `+Inf` bucket and makes the report print 1000,00 ms.
+    /// throttled and no repaint was requested. Classifying it as `late` puts a ~1 s sample in the
+    /// pacing histogram's tail and makes the report print 1000,00 ms as a p99.
     #[test]
     fn idle_and_throttle_gaps_are_not_presentation_misses() {
         assert!(!should_classify(16.667, 0.0), "primeiro quadro / delta zero");
