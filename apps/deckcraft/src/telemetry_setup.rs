@@ -317,7 +317,10 @@ where
         if record.target().starts_with("opentelemetry") {
             return;
         }
-        let nested = FORWARDING.with(|flag| flag.replace(true));
+        // `try_with` instead of `with`: a control-client thread can log while its TLS is being
+        // destroyed, where `with` panics. If the flag is unreachable, skip forwarding rather than
+        // panic on a thread that is already exiting.
+        let nested = FORWARDING.try_with(|flag| flag.replace(true)).unwrap_or(true);
         if nested {
             return;
         }

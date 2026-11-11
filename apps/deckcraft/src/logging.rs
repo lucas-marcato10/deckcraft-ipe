@@ -624,4 +624,39 @@ mod tests {
         record(&logger, log::Level::Trace, "deckcraft", "filtered out");
         assert_eq!(*seen.lock().unwrap_or_else(PoisonError::into_inner), ["INFO hello"]);
     }
+
+    /// The tee is reached from every thread that logs (the UI, the control server, the SDK worker).
+    /// Eight threads × 100 records must arrive exactly once each: not lost to `OnceLock` being read
+    /// while unset, and not double-forwarded into the OTel bridge.
+    #[test]
+    fn concurrent_records_reach_the_tee_once_each() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Counting(Arc<AtomicUsize>);
+        impl Tee for Counting {
+            fn log(&self, _record: &log::Record<'_>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let logger = Arc::new(AppLogger::new(Filter::parse("info"), false));
+        let seen = Arc::new(AtomicUsize::new(0));
+        logger.attach_tee(Box::new(Counting(Arc::clone(&seen))));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let logger = Arc::clone(&logger);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    record(&logger, log::Level::Info, "deckcraft", "hello");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker panicou");
+        }
+        assert_eq!(seen.load(Ordering::Relaxed), 800);
+    }
 }
