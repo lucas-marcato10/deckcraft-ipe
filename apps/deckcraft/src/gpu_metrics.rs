@@ -71,12 +71,23 @@ pub fn start() -> Option<Sampler> {
 }
 
 impl Sampler {
-    /// Ask the thread to finish and wait for it (at most one sleep slice).
+    /// Ask the thread to finish and wait, but never hold up process exit on a stuck `nvidia-smi`.
+    ///
+    /// A detached thread holds only an `Arc<AtomicBool>` and `&'static` instrument handles, both
+    /// valid until process exit, and recording into an already-shut-down provider is a no-op the
+    /// SDK handles. One sleep slice is 250 ms; the grace period is twice that.
     pub fn stop(&mut self) {
         use std::sync::atomic::Ordering;
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
+        let Some(worker) = self.worker.take() else { return };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if worker.is_finished() {
             let _ = worker.join();
+        } else {
+            log::warn!("gpu metrics: sampler did not stop within 500 ms; detaching");
         }
     }
 }
@@ -84,6 +95,13 @@ impl Sampler {
 impl Drop for Sampler {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+impl Sampler {
+    fn with_worker_for_test(stop: std::sync::Arc<std::sync::atomic::AtomicBool>, worker: std::thread::JoinHandle<()>) -> Sampler {
+        Sampler { stop, worker: Some(worker) }
     }
 }
 
@@ -148,5 +166,27 @@ mod tests {
     fn utilization_is_clamped_to_the_unit_interval() {
         assert_eq!(parse_sample("150, 10").map(|s| s.utilization), Some(1.0));
         assert_eq!(parse_sample("-5, 10").map(|s| s.utilization), Some(0.0));
+    }
+
+    /// `nvidia-smi` can hang while the driver is busy, and `stop()` runs from the app's `on_exit`:
+    /// waiting on that thread without a deadline would keep the process alive forever. The worker
+    /// here ignores the stop flag for two seconds — `stop()` must give up long before that.
+    #[test]
+    fn stop_does_not_block_on_a_stuck_worker() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::{Duration, Instant};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::spawn(|| {
+            // Simula um `nvidia-smi` travado: ignora o flag por 2 s.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let mut sampler = Sampler::with_worker_for_test(stop, worker);
+        let t0 = Instant::now();
+        sampler.stop();
+        assert!(t0.elapsed() < Duration::from_millis(900), "stop() bloqueou: {:?}", t0.elapsed());
     }
 }
