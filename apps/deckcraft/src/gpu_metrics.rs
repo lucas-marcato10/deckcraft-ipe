@@ -173,10 +173,7 @@ mod tests {
     /// here ignores the stop flag for two seconds — `stop()` must give up long before that.
     #[test]
     fn stop_does_not_block_on_a_stuck_worker() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+        use std::sync::{Arc, atomic::AtomicBool};
         use std::time::{Duration, Instant};
 
         let stop = Arc::new(AtomicBool::new(false));
