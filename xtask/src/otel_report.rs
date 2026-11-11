@@ -943,14 +943,22 @@ fn phases(run: &Run) -> Vec<Phase> {
 /// quase um no-op: dividir bytes reais por ~0 ms produz terabytes por segundo.
 const MIN_PHASE_MS_FOR_RATE: f64 = 1.0;
 
+/// Nenhum caminho de cópia host→device de uma estação de trabalho passa disto (PCIe 5.0 x16 fica
+/// em ~60 GB/s; memória unificada copia bem abaixo de 200 GB/s). Uma taxa derivada acima do teto
+/// não mede um dispositivo rápido: mede um denominador que não contém o trabalho — no harness
+/// headless `texture.bytes` conta pixels reais enquanto `tex.set` leva ~3 µs por quadro.
+const MAX_PLAUSIBLE_GB_PER_S: f64 = 256.0;
+
 /// GB/s from a summed byte count and a summed phase duration (both already in `ms` / bytes).
-/// `None` when the denominator is too small to mean anything — the report prints `n/a` instead of
-/// a number that would blame the wrong device.
+/// `None` when the pair is not a measurement: a denominator too small to mean anything, or an
+/// implied rate above the bus ceiling. The report prints `n/a` instead of a number that would
+/// blame the wrong device.
 fn bytes_per_second(byte_sum: f64, phase_ms: f64) -> Option<f64> {
     if !byte_sum.is_finite() || !phase_ms.is_finite() || byte_sum <= 0.0 || phase_ms < MIN_PHASE_MS_FOR_RATE {
         return None;
     }
-    Some(byte_sum / (phase_ms / 1000.0) / 1.0e9)
+    let gb_per_s = byte_sum / (phase_ms / 1000.0) / 1.0e9;
+    (gb_per_s <= MAX_PLAUSIBLE_GB_PER_S).then_some(gb_per_s)
 }
 
 fn raster(run: &Run) -> Raster {
@@ -1333,5 +1341,14 @@ mod rate_tests {
         let rate = bytes_per_second(13.3e9, 3300.0).expect("13,3 GB em 3,3 s");
         assert!((rate - 4.03).abs() < 0.1, "got {rate}");
         assert!(rate < 32.0, "acima de PCIe é mentira: {rate}");
+    }
+
+    /// Captura real (`target/otel/candidate`): 13,31 GB de bytes de textura contra 3,057 ms
+    /// somados em 1003 quadros do harness headless, onde `tex.set` é no-op. O total é 3 µs por
+    /// quadro — mil vezes maior que a estimativa de 0,003 ms, então um piso de 1 ms não o pega.
+    /// O que denuncia o absurdo é a própria taxa: 4,3 TB/s não existe.
+    #[test]
+    fn a_rate_above_the_bus_ceiling_is_not_a_measurement() {
+        assert_eq!(bytes_per_second(13.31e9, 3.057), None, "4,3 TB/s é impossível");
     }
 }
