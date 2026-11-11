@@ -304,4 +304,29 @@ mod tests {
             "resource attributes carry service.name: {attributes}"
         );
     }
+
+    /// Eight SDK-style writers appending at once must not lose or interleave a record: the lock
+    /// covers the whole `write_all` of one finished line. The reader parses every line, so a torn
+    /// record fails here even if the count happened to be right.
+    #[test]
+    fn concurrent_appends_keep_every_line_whole() {
+        use std::sync::Arc;
+        let dir = temp_dir("concurrent");
+        let file = Arc::new(JsonLinesFile::create(dir.join("metrics.jsonl")).expect("create"));
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let file = file.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..50 {
+                    let line = format!("{{\"t\":{t},\"i\":{i}}}");
+                    file.append(line.as_bytes()).expect("append");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer panicou");
+        }
+        let lines = read_json_lines(&dir.join("metrics.jsonl"));
+        assert_eq!(lines.len(), 400, "nenhuma linha pode ser perdida ou partida");
+    }
 }
