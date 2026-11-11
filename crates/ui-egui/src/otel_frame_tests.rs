@@ -557,3 +557,45 @@ fn an_edited_slide_misses_the_texture_cache_with_a_reason_and_times_every_phase(
         );
     }
 }
+
+/// A drag re-renders the same slide over and over, and every frame of it is a *new* document: the
+/// cache working as designed must not read as thrash. Only the exact same request missing twice
+/// inside the window is the cache failing to hold what it just computed.
+///
+/// This drives [`crate::textures::Textures::slide`] directly — one frame per call, the document
+/// edited between them — so the only canvas in the process is this one.
+#[test]
+fn a_drag_re_renders_are_not_thrash_but_a_repeated_identical_request_is() {
+    let _reading = reader();
+    let mut textures = crate::textures::Textures::default();
+    let mut session = Session::with_new();
+    let ctx = egui::Context::default();
+    let size = (320, 180);
+    let visible = deckcraft_render::Region::slide(size.0, size.1);
+    let draw = |textures: &mut crate::textures::Textures, session: &Session| {
+        let doc = session.active().expect("the sample session has a document").doc.clone();
+        let _ = textures.slide(&ctx, &doc, 0, size, visible, true, 0, false, &[], None, None).expect("a slide texture");
+    };
+
+    let before = total(&latest(), |point| point.metric == sc::M_CACHE_THRASH);
+    // The cold texture, then two edits of the same slide: a drag with one mutation per frame. Each
+    // edit hands the canvas a new `Arc`, so each key is a different request.
+    draw(&mut textures, &session);
+    session.execute("shape.insert", &json!({"preset": "rect", "rect": [100.0, 100.0, 300.0, 200.0]})).expect("insert the dragged shape");
+    draw(&mut textures, &session);
+    session.execute("shape.move", &json!({"dx": 30.0, "dy": 20.0})).expect("move the dragged shape");
+    draw(&mut textures, &session);
+
+    let after_drag = total(&latest(), |point| point.metric == sc::M_CACHE_THRASH) - before;
+    assert_eq!(after_drag, 0.0, "a drag's re-renders are a new document per frame, not thrash");
+
+    // The same unchanged document is a hit; `invalidate()` (fonts loaded, theme changed in place)
+    // drops the texture, and the exact same request misses a second time: that is the cache
+    // failing to hold the result it just computed.
+    draw(&mut textures, &session);
+    textures.invalidate();
+    draw(&mut textures, &session);
+
+    let after_invalidate = total(&latest(), |point| point.metric == sc::M_CACHE_THRASH) - before;
+    assert!((after_invalidate - 1.0).abs() < f64::EPSILON, "the exact same request missing twice is one thrash: {after_invalidate}");
+}

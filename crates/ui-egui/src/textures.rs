@@ -63,8 +63,10 @@ pub struct Textures {
     smartart: HashMap<String, TextureHandle>,
     clock: u64,
     pub last_render_ms: f64,
-    /// The last canvas miss's slide index and when it happened, for `texture.cache.thrash`.
-    last_miss: Option<(usize, f64)>,
+    /// The exact key of the last canvas miss and when it happened, for `texture.cache.thrash`.
+    /// Comparing the whole `Key` (not the slide index) separates "the cache failed to hold the
+    /// result it just computed" from "the document, zoom or animation changed".
+    last_miss: Option<(Key, f64)>,
     /// `invalidate()` dropped the canvas texture: the next miss is attributed to it instead of to
     /// a key field that did not change.
     invalidated: bool,
@@ -339,7 +341,7 @@ impl Textures {
         }
         let reason = self.miss_reason(&key);
         self.invalidated = false;
-        self.note_canvas_miss(index, reason);
+        self.note_canvas_miss(index, &key, reason);
         let t0 = crate::now_ms();
         let render_threads = threads();
         let render = |region: Region| {
@@ -447,7 +449,7 @@ impl Textures {
     /// The counter feeds the report, the span event places the miss inside the frame that paid for
     /// it, and the log line survives when only logs are exported. The miss path runs once per
     /// change, not per frame, so the `Vec` here is not a hot-path allocation.
-    fn note_canvas_miss(&mut self, index: usize, reason: Option<&'static str>) {
+    fn note_canvas_miss(&mut self, index: usize, key: &Key, reason: Option<&'static str>) {
         let mut attrs = Vec::with_capacity(3);
         attrs.push(KeyValue::new(sc::A_CACHE_KIND, sc::V_CANVAS));
         attrs.push(KeyValue::new(sc::A_CACHE_RESULT, sc::V_MISS));
@@ -466,15 +468,16 @@ impl Textures {
         }
         instruments().texture_cache.add(1, &attrs);
         let now = crate::now_ms();
-        if let Some((last_index, last_at)) = self.last_miss
-            && last_index == index
-            && now - last_at < THRASH_WINDOW_MS
+        if let Some((last_key, last_at)) = &self.last_miss
+            && *last_key == *key
+            && now - *last_at < THRASH_WINDOW_MS
         {
-            // The same slide was rebuilt again a few frames later: the cache is not holding what
-            // the canvas asks for, which is the failure #969 described for the thumbnail pane.
+            // The exact same request missed again a few frames later: the cache did not hold the
+            // result it just computed. A different key means the document (Arc pointer), zoom,
+            // region or animation changed — a legitimate re-render, not thrash.
             instruments().texture_thrash.add(1, &[KeyValue::new(sc::A_SLIDE_INDEX, index as i64)]);
         }
-        self.last_miss = Some((index, now));
+        self.last_miss = Some((key.clone(), now));
     }
 
     /// Cached thumbnails (bounded; soak tests check it).
