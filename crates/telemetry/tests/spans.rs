@@ -280,3 +280,34 @@ fn pending_interactions_stay_bounded_when_paints_never_arrive() {
         assert_eq!(spans::pending_interactions(), 0);
     });
 }
+
+/// The map is shared by every UI thread: a gesture that begins on one thread is painted on
+/// another. Eight threads driving 200 complete interactions each must neither lose a paint (a
+/// begin without its painted is a leaked span) nor deadlock on the map or on the span ends that
+/// happen outside it.
+///
+/// Deliberately inside `with_global_recorder`: the recorder serialises every test that touches the
+/// process-wide pending map, and this one touches it hardest. Without that, the concurrent churn
+/// would interleave with the invariant assertions of the three tests above.
+#[test]
+fn concurrent_interactions_never_leak_or_deadlock() {
+    with_global_recorder(|_tracer| {
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            handles.push(std::thread::spawn(move || {
+                for i in 0..200 {
+                    let key = format!("t{t}-{i}");
+                    spans::interaction_begin(&key, "drag", i as f64);
+                    spans::interaction_dispatched(&key, i as f64 + 0.1);
+                    let inp = spans::interaction_painted(&key, i as f64 + 1.0);
+                    assert!(inp.is_some(), "cada begin deve ter seu painted");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker panicou");
+        }
+        assert_eq!(spans::pending_interactions(), 0);
+        assert!(spans::pending_interactions() <= spans::MAX_PENDING_INTERACTIONS);
+    });
+}
