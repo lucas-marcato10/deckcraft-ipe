@@ -40,6 +40,20 @@ const TOLERANCE: f64 = 0.5;
 /// stall (and `late`), not a split.
 const SPLIT_END: f64 = 2.5;
 
+/// Past this many refresh intervals the gap is the app being idle or throttled, not a present that
+/// arrived late. Ten intervals at 60 Hz is ≈167 ms: it covers a multi-refresh stall without
+/// swallowing a one-second sleep.
+pub const MAX_PACING_INTERVALS: f64 = 10.0;
+
+/// Whether a frame gap can be compared against the display interval at all.
+///
+/// `delta_ms` is the gap between two *frame starts*. The app only runs `ui()` when a repaint was
+/// requested, so a gap of seconds means the app was idle — there was no present to be late. The
+/// first frame has no predecessor and is already excluded by the caller's `None` delta.
+pub fn should_classify(interval_ms: f64, delta_ms: f64) -> bool {
+    delta_ms.is_finite() && delta_ms > 0.0 && interval_ms.is_finite() && interval_ms > 0.0 && delta_ms <= MAX_PACING_INTERVALS * interval_ms
+}
+
 /// Classify one frame interval against the display interval.
 ///
 /// A non-finite or non-positive `interval_ms` and a non-finite `dt_ms` yield an empty verdict:
@@ -51,7 +65,7 @@ pub fn pacing(interval_ms: f64, dt_ms: f64, present_mode: &str) -> Verdict {
     let intervals = dt_ms / interval_ms;
     let late = intervals > 1.0 + TOLERANCE;
     Verdict {
-        error_ms: dt_ms - interval_ms,
+        error_ms: (dt_ms - interval_ms).max(0.0),
         late,
         split: late && intervals < SPLIT_END,
         // `immediate` and friends do not wait for the display, so a frame may be presented twice
@@ -198,5 +212,26 @@ mod tests {
         for (interval, dt) in [(0.0, 16.0), (-16.0, 16.0), (f64::NAN, 16.0), (16.667, f64::INFINITY)] {
             assert_eq!(pacing(interval, dt, "fifo"), Verdict { error_ms: 0.0, late: false, split: false, duplicate: false });
         }
+    }
+
+    /// An interval of a second between two `ui()` passes is not a late present: the app was idle or
+    /// throttled and no repaint was requested. Classifying it as `late` poisons the p99 with the
+    /// `+Inf` bucket and makes the report print 1000,00 ms.
+    #[test]
+    fn idle_and_throttle_gaps_are_not_presentation_misses() {
+        assert!(!should_classify(16.667, 0.0), "primeiro quadro / delta zero");
+        assert!(!should_classify(16.667, f64::NAN));
+        assert!(should_classify(16.667, 16.7), "quadro normal");
+        assert!(should_classify(16.667, 34.0), "dois intervalos: late real");
+        assert!(should_classify(16.667, 160.0), "10 intervalos: ainda classificável");
+        assert!(!should_classify(16.667, 200.0), "12 intervalos: app dormindo");
+        assert!(!should_classify(16.667, 1000.0), "1 s de idle");
+    }
+
+    /// `error_ms` feeds a histogram whose first bound is 4.0; a negative value would fall into the
+    /// first bucket as if it were a small deviation.
+    #[test]
+    fn a_fast_frame_does_not_record_a_negative_pacing_error() {
+        assert_eq!(pacing(16.667, 8.0, "immediate").error_ms, 0.0);
     }
 }
