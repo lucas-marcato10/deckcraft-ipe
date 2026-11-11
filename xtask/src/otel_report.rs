@@ -939,6 +939,20 @@ fn phases(run: &Run) -> Vec<Phase> {
     out
 }
 
+/// Mínimo de duração somada de uma fase para derivar uma taxa. No harness headless o `tex.set` é
+/// quase um no-op: dividir bytes reais por ~0 ms produz terabytes por segundo.
+const MIN_PHASE_MS_FOR_RATE: f64 = 1.0;
+
+/// GB/s from a summed byte count and a summed phase duration (both already in `ms` / bytes).
+/// `None` when the denominator is too small to mean anything — the report prints `n/a` instead of
+/// a number that would blame the wrong device.
+fn bytes_per_second(byte_sum: f64, phase_ms: f64) -> Option<f64> {
+    if !byte_sum.is_finite() || !phase_ms.is_finite() || byte_sum <= 0.0 || phase_ms < MIN_PHASE_MS_FOR_RATE {
+        return None;
+    }
+    Some(byte_sum / (phase_ms / 1000.0) / 1.0e9)
+}
+
 fn raster(run: &Run) -> Raster {
     let duration = hist_totals(run, sc::M_RASTER_DURATION);
     let pixels = hist_totals(run, sc::M_RASTER_PIXELS);
@@ -951,7 +965,7 @@ fn raster(run: &Run) -> Raster {
     let mpx_per_s = (raster_ms > 0.0).then(|| raster_px / (raster_ms / 1000.0));
     let average_mpx = (pixel_count > 0).then(|| raster_px / pixel_count as f64);
     let gb_per_s = match (bytes, upload_ms) {
-        (Some((_, byte_sum, _, _)), Some(upload_ms)) if upload_ms > 0.0 => Some(byte_sum / (upload_ms / 1000.0) / 1.0e9),
+        (Some((_, byte_sum, _, _)), Some(upload_ms)) => bytes_per_second(byte_sum, upload_ms),
         _ => None,
     };
     Raster { ms_per_mpx, mpx_per_s, average_mpx, gb_per_s }
@@ -1299,5 +1313,25 @@ mod quantile_tests {
         let buckets = [1_u64, 2, 3, 0];
         assert!(histogram_quantile(&bounds, &buckets, 6, 0.50).is_some());
         assert_eq!(histogram_quantile(&bounds, &buckets, 0, 0.50), None);
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::bytes_per_second;
+
+    #[test]
+    fn a_no_op_upload_cannot_produce_a_throughput() {
+        // 13,3 GB reais medidos contra ~0,003 ms de tex.set no harness headless.
+        assert_eq!(bytes_per_second(13.3e9, 0.003), None);
+        assert_eq!(bytes_per_second(13.3e9, 0.0), None);
+        assert_eq!(bytes_per_second(f64::NAN, 3300.0), None);
+    }
+
+    #[test]
+    fn a_real_upload_produces_a_plausible_gb_per_s() {
+        let rate = bytes_per_second(13.3e9, 3300.0).expect("13,3 GB em 3,3 s");
+        assert!((rate - 4.03).abs() < 0.1, "got {rate}");
+        assert!(rate < 32.0, "acima de PCIe é mentira: {rate}");
     }
 }
